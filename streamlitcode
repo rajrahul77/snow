@@ -1,1 +1,2560 @@
+# Snowflake Cost & Performance Governance Dashboard
+# Co-authored with CoCo
+import pandas as pd
+import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
 
+# --- PAGE CONFIGURATION ---
+st.set_page_config(
+    page_title="Snowflake Cost & Performance Governance",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+SCHEMA = "ECOMMERCE_DEV.COST_ANALYTICS"
+
+# --- DESIGN SYSTEM & CSS OVERRIDES ---
+st.markdown("""
+    <style>
+        /* Base layout adjustments */
+        .block-container { 
+            padding-top: 1.5rem; 
+            padding-bottom: 2rem; 
+            max-width: 1400px;
+        }
+        
+        /* Typography */
+        html, body, [class*="css"] {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            color: #1e293b;
+        }
+        
+        /* Minimalist Metric Cards — forced to equal height for symmetry */
+        div[data-testid="stMetric"] {
+            background-color: #ffffff;
+            border: 1px solid #e2e8f0;
+            padding: 14px 16px;
+            border-radius: 8px;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+            min-height: 108px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+            overflow: hidden;
+            transition: border-color 0.15s ease, box-shadow 0.15s ease;
+        }
+        div[data-testid="stMetric"]:hover {
+            border-color: #cbd5e1;
+            box-shadow: 0 2px 8px rgba(15, 23, 42, 0.07);
+        }
+        div[data-testid="stMetric"] label {
+            font-size: 0.7rem !important;
+            text-transform: uppercase;
+            letter-spacing: 0.055em;
+            color: #64748b !important;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        /* Value: clamp long strings so no card grows taller than its siblings */
+        div[data-testid="stMetric"] div[data-testid="stMetricValue"] {
+            font-size: 1.35rem !important;
+            font-weight: 650;
+            color: #0f172a;
+            line-height: 1.25;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            max-width: 100%;
+        }
+        div[data-testid="stMetric"] div[data-testid="stMetricDelta"] {
+            font-size: 0.72rem !important;
+            font-weight: 600;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+        /* Universal convention: red = bad, green = good */
+        div[data-testid="stMetricDelta"] svg[data-testid="stMetricDeltaIcon-Up"] ~ div,
+        div[data-testid="stMetricDelta"] svg[data-testid="stMetricDeltaIcon-Down"] ~ div {
+            font-weight: 600;
+        }
+        /* Equalise every column inside a KPI row */
+        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] {
+            display: flex;
+            flex-direction: column;
+        }
+        div[data-testid="stHorizontalBlock"] > div[data-testid="column"] > div {
+            height: 100%;
+        }
+
+        /* Progress bars follow the same palette */
+        div[data-testid="stProgress"] > div > div > div > div {
+            background-image: linear-gradient(90deg, #059669, #0284c7);
+        }
+
+        /* Tabs Styling */
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 4px;
+            border-bottom: 1px solid #e2e8f0;
+            overflow-x: auto;
+        }
+        .stTabs [data-baseweb="tab"] {
+            font-size: 0.8125rem;
+            font-weight: 500;
+            padding: 8px 14px;
+            border-radius: 6px 6px 0 0;
+            background-color: transparent;
+            color: #64748b;
+            border: none;
+            white-space: nowrap;
+        }
+        .stTabs [data-baseweb="tab"]:hover {
+            background-color: #f1f5f9;
+            color: #0f172a;
+        }
+        .stTabs [aria-selected="true"] {
+            background-color: #ffffff !important;
+            color: #0f172a !important;
+            font-weight: 650 !important;
+            border-bottom: 2px solid #0284c7 !important;
+        }
+
+        /* Dataframe Styling */
+        .stDataFrame {
+            border: 1px solid #e2e8f0;
+            border-radius: 8px;
+        }
+
+        /* Inline granularity radios read as segmented controls */
+        div[role="radiogroup"] {
+            gap: 6px;
+        }
+        div[role="radiogroup"] label {
+            font-size: 0.78rem;
+        }
+
+        /* Alert callouts — softer, on-palette */
+        div[data-testid="stAlert"] {
+            border-radius: 8px;
+            border-left-width: 4px;
+        }
+    </style>
+""", unsafe_allow_html=True)
+
+
+# --- SAFE NUMERIC CONVERSION HELPERS ---
+def safe_num(val, default=0.0):
+    """Safely converts any value (Decimal, string, series sum, None) to float."""
+    try:
+        if val is None or pd.isna(val):
+            return default
+        if isinstance(val, (pd.Series, pd.Index)):
+            val = pd.to_numeric(val, errors="coerce").sum()
+        return float(val)
+    except Exception:
+        return default
+
+@st.cache_data(ttl=600)
+def run_query(view_name):
+    try:
+        _conn = st.connection("snowflake")
+        df = _conn.query(f"SELECT * FROM {SCHEMA}.{view_name}")
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        for col in df.columns:
+            # Datetime detection MUST run before numeric coercion, otherwise
+            # pd.to_numeric turns timestamps into epoch nanoseconds.
+            if pd.api.types.is_datetime64_any_dtype(df[col]):
+                has_time = False
+                try:
+                    has_time = bool((df[col].dt.hour.fillna(0) != 0).any() or
+                                    (df[col].dt.minute.fillna(0) != 0).any())
+                except Exception:
+                    has_time = False
+                df[col] = df[col].dt.strftime("%Y-%m-%d %H:%M" if has_time else "%Y-%m-%d")
+                df[col] = df[col].fillna("")
+                continue
+
+            if df[col].dtype == "object":
+                sample = df[col].dropna().head(20)
+                if len(sample) > 0 and sample.apply(lambda x: hasattr(x, "strftime")).all():
+                    df[col] = df[col].apply(
+                        lambda x: x.strftime("%Y-%m-%d") if hasattr(x, "strftime") else ("" if x is None else str(x))
+                    )
+                    continue
+                # Quoted date strings coming back as '"""2026-08-11"""'
+                stripped = df[col].astype(str).str.replace('"', '', regex=False).str.strip()
+                if len(sample) > 0:
+                    probe = pd.to_datetime(stripped, errors="coerce")
+                    if probe.notna().mean() > 0.8:
+                        has_time = False
+                        try:
+                            has_time = bool((probe.dt.hour.fillna(0) != 0).any() or
+                                            (probe.dt.minute.fillna(0) != 0).any())
+                        except Exception:
+                            has_time = False
+                        df[col] = probe.dt.strftime("%Y-%m-%d %H:%M" if has_time else "%Y-%m-%d").fillna("")
+                        continue
+
+            try:
+                numeric_series = pd.to_numeric(df[col], errors="coerce")
+                if not numeric_series.isna().all():
+                    df[col] = numeric_series.fillna(0.0)
+                    continue
+            except Exception:
+                pass
+
+            if df[col].dtype == "object":
+                df[col] = df[col].fillna("").astype(str)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+# --- DESIGN TOKENS (universal red = bad, green = good) ---
+CLR_BAD = "#dc2626"      # rose
+CLR_WARN = "#d97706"     # amber
+CLR_GOOD = "#059669"     # emerald
+CLR_ACCENT = "#0284c7"   # sky
+CLR_MUTED = "#64748b"    # slate
+
+# Columns where a HIGHER value is worse (cost, waste, failures)
+_HIGH_IS_BAD = (
+    "CREDIT", "COST", "USD", "SPEND", "SPILL", "SCAN", "QUEUE", "IDLE",
+    "FAIL", "DUPLICATE", "TOKEN", "ELAPSED", "SECONDS", "GB", "MB",
+    "DAYS_SINCE", "Z_SCORE", "VELOCITY", "CHANGE", "ANOMAL", "DORMAN",
+)
+# Columns where a HIGHER value is better
+_HIGH_IS_GOOD = ("EFFICIENCY", "SCORE", "UTILIZATION", "HEALTH", "PASSED", "ACTIVE_HOURS")
+
+
+def sev_delta(col_name):
+    """Universal convention: red when a cost/waste metric rises, green when a
+    quality metric rises. Returns a value for st.metric(delta_color=...)."""
+    u = str(col_name).upper()
+    if any(k in u for k in _HIGH_IS_GOOD):
+        return "normal"
+    if any(k in u for k in _HIGH_IS_BAD):
+        return "inverse"
+    return "off"
+
+
+def fmt_month(df, cols=None):
+    """Renders month columns as MM/YYYY."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    targets = cols if cols else [c for c in df.columns if c.upper() in ("MONTH", "MONTH_START", "ORDER_MONTH")]
+    for col in targets:
+        if col not in df.columns:
+            continue
+        try:
+            raw = df[col].astype(str).str.replace('"', '', regex=False).str.strip()
+            parsed = pd.to_datetime(raw, errors="coerce")
+            if parsed.notna().any():
+                df[col] = parsed.dt.strftime("%m/%Y").fillna("")
+        except Exception:
+            pass
+    return df
+
+
+def show_table(df, height=None):
+    """Renders a plain dataframe — no cell shading, no bold columns."""
+    if df is None or df.empty:
+        return
+    kwargs = {"hide_index": True, "use_container_width": True}
+    if height:
+        kwargs["height"] = height
+    st.dataframe(df, **kwargs)
+
+
+def axis_label(df, mapping):
+    """Renames columns to human-readable axis labels for charting."""
+    if df is None or df.empty:
+        return df
+    return df.rename(columns={k: v for k, v in mapping.items() if k in df.columns})
+
+
+def drill_control(key, default="Date", options=("Date", "Month", "Year")):
+    """Progressive drill-down: pill-style granularity selector + contextual period filter.
+    Returns the selected grain string (Date/Month/Year)."""
+    grain = st.segmented_control("Granularity", list(options),
+                                  default=default, key=key)
+    if grain is None:
+        grain = default
+    return grain
+
+
+def _drill_period_filter(df, date_col, grain, key):
+    """Shows a contextual period filter when drilling into a finer grain.
+    Returns a filtered copy of the dataframe (or original if no filter applies)."""
+    if df is None or df.empty or date_col not in df.columns:
+        return df
+    raw = df[date_col].astype(str).str.replace('"', '', regex=False).str.strip()
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if parsed.isna().all():
+        return df
+
+    if grain == "Date":
+        # Show month filter so user picks which month to expand into days
+        months = sorted(parsed.dropna().dt.to_period("M").unique())
+        if len(months) > 1:
+            labels = [str(m.strftime("%b %Y")) for m in months]
+            selected = st.selectbox("Expand month", ["All"] + labels,
+                                    index=0, key=f"{key}_month_filter")
+            if selected != "All":
+                idx = labels.index(selected)
+                period = months[idx]
+                mask = parsed.dt.to_period("M") == period
+                return df[mask].copy()
+    elif grain == "Month":
+        # Show year filter so user picks which year to expand into months
+        years = sorted(parsed.dropna().dt.year.unique())
+        if len(years) > 1:
+            year_labels = [str(int(y)) for y in years]
+            selected = st.selectbox("Expand year", ["All"] + year_labels,
+                                    index=0, key=f"{key}_year_filter")
+            if selected != "All":
+                mask = parsed.dt.year == int(selected)
+                return df[mask].copy()
+    return df
+
+
+def apply_drill(df, date_col, value_cols, grain, agg="sum", group_col=None, drill_key=None):
+    """Aggregates a date-based frame to Date / Month / Year granularity.
+    When drill_key is provided, a contextual period filter is shown first."""
+    if df is None or df.empty or date_col not in df.columns:
+        return df
+
+    # Apply progressive filter if a drill_key was given
+    if drill_key:
+        df = _drill_period_filter(df, date_col, grain, drill_key)
+
+    out = df.copy()
+    raw = out[date_col].astype(str).str.replace('"', '', regex=False).str.strip()
+    parsed = pd.to_datetime(raw, errors="coerce")
+    if parsed.isna().all():
+        return out
+
+    if grain == "Month":
+        out[date_col] = parsed.dt.strftime("%m/%Y")
+    elif grain == "Year":
+        out[date_col] = parsed.dt.strftime("%Y")
+    else:
+        out[date_col] = parsed.dt.strftime("%Y-%m-%d")
+
+    value_cols = [c for c in (value_cols or []) if c and c in out.columns
+                  and pd.api.types.is_numeric_dtype(out[c])]
+    if not value_cols:
+        return out
+
+    keys = [date_col] + ([group_col] if group_col and group_col in out.columns else [])
+    try:
+        out = out.groupby(keys, as_index=False)[value_cols].agg(agg)
+        return out.sort_values(date_col)
+    except Exception:
+        return out
+
+
+def clean_dates(df, cols=None, keep_time=False):
+    """Strips quote artifacts and timezone noise from date/timestamp columns."""
+    if df is None or df.empty:
+        return df
+    df = df.copy()
+    targets = cols if cols else [
+        c for c in df.columns
+        if any(k in c.upper() for k in ["DATE", "TIME", "CREATED_ON", "SLOT", "LOGIN"])
+    ]
+    for col in targets:
+        if col not in df.columns:
+            continue
+        try:
+            cleaned = df[col].astype(str).str.replace('"', '', regex=False).str.strip()
+            parsed = pd.to_datetime(cleaned, errors="coerce", utc=False)
+            if parsed.notna().any():
+                fmt = "%Y-%m-%d %H:%M" if keep_time else "%Y-%m-%d"
+                df[col] = parsed.dt.strftime(fmt).fillna("")
+            else:
+                df[col] = cleaned
+        except Exception:
+            pass
+    return df
+
+
+def get_best_col(df, candidates, default_index=0):
+    """Finds the first existing candidate column in DataFrame or falls back safely."""
+    if df is None or df.empty:
+        return None
+    for col in candidates:
+        if col in df.columns:
+            return col
+    if len(df.columns) > default_index:
+        return df.columns[default_index]
+    return None
+
+def safe_render_chart(chart_type, df, x_candidates, y_candidates, color_candidates=None, multi_y=False):
+    """
+    Renders charts safely by resolving actual columns dynamically.
+    When multi_y is False (default), picks ONLY ONE single best matching Y column to prevent duplicate unit stacking.
+    """
+    if df is None or df.empty:
+        return
+    
+    x_col = get_best_col(df, x_candidates, 0)
+    
+    if isinstance(y_candidates, list):
+        if multi_y:
+            existing_y = [c for c in y_candidates if c in df.columns]
+            y_col = existing_y if len(existing_y) > 1 else (existing_y[0] if existing_y else None)
+        else:
+            # Pick ONLY the top priority matching column (e.g., DISPLAY_COST first)
+            y_col = None
+            for c in y_candidates:
+                if c in df.columns:
+                    y_col = c
+                    break
+            if not y_col:
+                y_col = get_best_col(df, y_candidates, 1 if len(df.columns) > 1 else 0)
+    else:
+        y_col = get_best_col(df, [y_candidates], 1 if len(df.columns) > 1 else 0)
+        
+    color_col = None
+    if color_candidates:
+        color_col = get_best_col(df, color_candidates if isinstance(color_candidates, list) else [color_candidates], None)
+
+    if not x_col or not y_col:
+        st.dataframe(df, hide_index=True, use_container_width=True)
+        return
+
+    try:
+        kwargs = {"x": x_col, "y": y_col}
+        if color_col and color_col in df.columns:
+            kwargs["color"] = color_col
+
+        if chart_type == "line":
+            st.line_chart(df, **kwargs)
+        elif chart_type == "bar":
+            st.bar_chart(df, **kwargs)
+        elif chart_type == "area":
+            st.area_chart(df, **kwargs)
+        elif chart_type == "scatter":
+            st.scatter_chart(df, **kwargs)
+    except Exception:
+        st.dataframe(df, hide_index=True, use_container_width=True)
+
+def get_user_security_context():
+    """Returns (display_name, primary_role, tier)."""
+    def pretty(raw):
+        s = str(raw or "").strip()
+        if not s:
+            return "User"
+        # RAHUL.P -> Rahul P ; jane_doe -> Jane Doe
+        parts = [p for p in s.replace("_", " ").replace(".", " ").split() if p]
+        return " ".join(p.capitalize() for p in parts) if parts else s
+
+    try:
+        _conn = st.connection("snowflake")
+        ctx = _conn.query("""
+            SELECT CURRENT_USER() AS USER_NAME,
+                   CURRENT_ROLE() AS PRIMARY_ROLE,
+                   ARRAY_AGG(ROLE_NAME) WITHIN GROUP (ORDER BY ROLE_NAME) AS ALL_ROLES
+            FROM TABLE(INFORMATION_SCHEMA.APPLICABLE_ROLES())
+        """)
+        if ctx is not None and not ctx.empty:
+            uname = pretty(ctx["USER_NAME"].iloc[0])
+            primary = str(ctx["PRIMARY_ROLE"].iloc[0])
+            all_roles = str(ctx["ALL_ROLES"].iloc[0])
+            if "ACCOUNTADMIN" in all_roles or "FINOPS_ADMIN" in all_roles:
+                return uname, primary, "ADMIN"
+            if "DATA_ENGINEER" in all_roles or "SYSADMIN" in all_roles:
+                return uname, primary, "ENGINEER"
+            return uname, primary, "VIEWER"
+        return "User", "PUBLIC", "VIEWER"
+    except Exception:
+        # Fallback: try simpler queries individually
+        try:
+            _conn = st.connection("snowflake")
+            fallback = _conn.query("SELECT CURRENT_USER() AS U, CURRENT_ROLE() AS R")
+            if fallback is not None and not fallback.empty:
+                return pretty(fallback["U"].iloc[0]), str(fallback["R"].iloc[0]), "ADMIN"
+        except Exception:
+            pass
+        return "User", "PUBLIC", "ADMIN"
+
+user_name, primary_role, user_tier = get_user_security_context()
+
+
+# --- HEADER & CONTROLS ---
+st.title("Cost & Performance Intelligence")
+st.markdown(f"**{user_name}** &nbsp;|&nbsp; Role: `{primary_role}`")
+
+with st.sidebar:
+    st.markdown("### Controls")
+    if st.button("Refresh Cache", use_container_width=True):
+        run_query.clear()
+        st.rerun()
+        
+    st.markdown("---")
+    st.markdown("### Webhook Notification")
+    webhook_url = st.text_input("Slack / Teams Endpoint", type="password")
+    if st.button("Dispatch Test Alert", use_container_width=True):
+        if webhook_url:
+            try:
+                _conn = st.connection("snowflake")
+                _conn.query(f"CALL {SCHEMA}.SEND_SLACK_FINOPS_ALERT('{webhook_url}', 'FinOps Governance Alert: Threshold Exceeded')")
+                st.sidebar.success("Notification dispatched.")
+            except Exception as ex:
+                st.sidebar.error(f"Dispatch failed: {ex}")
+        else:
+            st.sidebar.warning("Endpoint URL required.")
+
+
+# --- NAVIGATION TABS ---
+(
+    tab_overview,
+    tab_warehouse,
+    tab_users,
+    tab_serverless,
+    tab_storage,
+    tab_perf,
+    tab_containers,
+    tab_waste,
+    tab_burndown,
+    tab_remediation,
+    tab_velocity,
+    tab_anomalies,
+    tab_antipatterns,
+    tab_concurrency,
+    tab_identity,
+    tab_ai,
+    tab_forecast,
+) = st.tabs([
+    "Overview",
+    "Warehouses",
+    "Users",
+    "Serverless",
+    "Storage",
+    "Query Performance",
+    "Containers",
+    "Efficiency Score",
+    "Budget Burn-Down",
+    "Remediation Console",
+    "Cost Velocity",
+    "Anomalies",
+    "Anti-Patterns",
+    "Concurrency & Sizing",
+    "Identity Governance",
+    "AI / Cortex",
+    "ML Forecast",
+])
+
+
+# ==============================================================================
+# 1. OVERVIEW — Executive Command Center
+# ==============================================================================
+with tab_overview:
+    st.markdown("### Executive Cost Intelligence")
+
+    # --- Load all data sources for the overview ---
+    df_service = run_query("VW_COST_BY_SERVICE")
+    df_forecast = run_query("VW_COST_FORECAST")
+    df_usd_summary = run_query("VW_COST_SUMMARY_USD")
+    df_burn = run_query("VW_BUDGET_BURNDOWN")
+    df_waste = run_query("VW_WASTE_SCORE")
+    df_ai_svc = run_query("VW_CORTEX_AI_USAGE")
+    df_top = run_query("VW_TOP_RESOURCES")
+    df_ml_fc = run_query("ML_SPEND_FORECAST")
+    df_anomalies = run_query("VW_COST_ANOMALIES")
+
+    # --- Compute executive metrics ---
+    date_col = get_best_col(df_service, ["USAGE_DATE", "START_TIME", "DATE"]) if not df_service.empty else None
+    credit_col = get_best_col(df_service, ["TOTAL_CREDITS", "CREDITS_USED", "CREDITS"]) if not df_service.empty else None
+
+    # MTD spend
+    mtd_spend = 0.0
+    if not df_burn.empty:
+        mtd_col = get_best_col(df_burn, ["MTD_CREDITS", "MTD_SPEND"])
+        if mtd_col:
+            mtd_spend = safe_num(df_burn[mtd_col].iloc[-1])
+
+    # 7-day and prior 7-day for WoW delta
+    total_7d = 0.0
+    wow_delta = None
+    if not df_service.empty and date_col and credit_col:
+        max_date = df_service[date_col].max()
+        seven_days_ago = str(pd.Timestamp(max_date) - pd.Timedelta(days=7))[:10]
+        fourteen_days_ago = str(pd.Timestamp(max_date) - pd.Timedelta(days=14))[:10]
+        recent = df_service[df_service[date_col] >= seven_days_ago]
+        prior = df_service[(df_service[date_col] >= fourteen_days_ago) & (df_service[date_col] < seven_days_ago)]
+        total_7d = safe_num(recent[credit_col].sum())
+        prior_7d = safe_num(prior[credit_col].sum())
+        if prior_7d > 0:
+            wow_delta = round(((total_7d - prior_7d) / prior_7d) * 100, 1)
+
+    # Projected monthly — keep the unit consistent with the other KPI cards
+    proj_monthly = 0.0
+    proj_usd = 0.0
+    if not df_forecast.empty:
+        if "PROJECTED_MONTHLY_CREDITS" in df_forecast.columns:
+            proj_monthly = safe_num(df_forecast["PROJECTED_MONTHLY_CREDITS"].iloc[-1])
+        if "PROJECTED_MONTHLY_USD" in df_forecast.columns:
+            proj_usd = safe_num(df_forecast["PROJECTED_MONTHLY_USD"].iloc[-1])
+    # Fall back to the burn-down projection when the forecast view is thin
+    if proj_monthly <= 0 and not df_burn.empty:
+        proj_monthly = safe_num(df_burn.iloc[-1].get("PROJECTED_EOM", 0))
+
+    # Efficiency score
+    efficiency_score = 0.0
+    if not df_waste.empty:
+        s_col = get_best_col(df_waste, ["EFFICIENCY_SCORE", "SCORE"])
+        if s_col:
+            efficiency_score = safe_num(df_waste[s_col].mean())
+
+    # AI spend share
+    total_ai_credits = 0.0
+    ai_pct = 0.0
+    if not df_ai_svc.empty and "CREDITS_USED" in df_ai_svc.columns:
+        total_ai_credits = safe_num(df_ai_svc["CREDITS_USED"].sum())
+        total_all = safe_num(df_service[credit_col].sum()) if (not df_service.empty and credit_col) else 0
+        if total_all > 0:
+            ai_pct = round((total_ai_credits / (total_all + total_ai_credits)) * 100, 1)
+
+    # -------------------------------------------------------------------------
+    # ROW 1: The Big 5 Executive KPIs — all in credits, one decimal, symmetric
+    # -------------------------------------------------------------------------
+    col1, col2, col3, col4, col5 = st.columns(5)
+    with col1:
+        st.metric("MTD Spend", f"{mtd_spend:,.1f} cr",
+                  delta=f"{wow_delta:+.1f}% WoW" if wow_delta is not None else "—",
+                  delta_color="inverse")
+    with col2:
+        st.metric("Projected Month", f"{proj_monthly:,.1f} cr",
+                  delta=f"${proj_usd:,.2f} est." if proj_usd > 0 else "—",
+                  delta_color="off")
+    with col3:
+        st.metric("7-Day Burn", f"{total_7d:,.1f} cr",
+                  delta=f"{wow_delta:+.1f}% vs prior" if wow_delta is not None else "—",
+                  delta_color="inverse")
+    with col4:
+        if efficiency_score >= 80:
+            eff_delta = "Healthy"
+        elif efficiency_score >= 60:
+            eff_delta = "Needs attention"
+        else:
+            eff_delta = "Critical"
+        st.metric("Efficiency Score", f"{efficiency_score:,.1f} /100", delta=eff_delta,
+                  delta_color="normal" if efficiency_score >= 80 else "inverse")
+    with col5:
+        st.metric("AI Investment", f"{total_ai_credits:,.1f} cr",
+                  delta=f"{ai_pct:.1f}% of total",
+                  delta_color="inverse" if ai_pct > 30 else "off")
+
+    # -------------------------------------------------------------------------
+    # ROW 2: Interactive Date Range + Granularity Controls
+    # -------------------------------------------------------------------------
+    st.markdown("")
+    ctl1, ctl2 = st.columns([1, 1])
+    with ctl1:
+        date_range = st.radio("Analysis Window", ["7 Days", "14 Days", "30 Days", "All"],
+                              horizontal=True, index=0, key="overview_range")
+    with ctl2:
+        ov_grain = drill_control("overview_grain", default="Date")
+    range_days = {"7 Days": 7, "14 Days": 14, "30 Days": 30, "All": 3650}[date_range]
+
+    # Filter service data by selected range
+    if not df_service.empty and date_col and credit_col:
+        max_date = df_service[date_col].max()
+        cutoff = str(pd.Timestamp(max_date) - pd.Timedelta(days=range_days))[:10]
+        df_filtered = df_service[df_service[date_col] >= cutoff].copy()
+    else:
+        df_filtered = pd.DataFrame()
+
+    # -------------------------------------------------------------------------
+    # ROW 3: Hero Chart — Daily Cost Trend (filtered + drillable)
+    # -------------------------------------------------------------------------
+    if not df_filtered.empty:
+        st.markdown(f"#### Cost Decomposition by {ov_grain}")
+        svc_grp = get_best_col(df_filtered, ["SERVICE_TYPE", "SERVICE"])
+        hero = apply_drill(df_filtered, date_col, [credit_col], ov_grain, group_col=svc_grp, drill_key="overview_grain")
+        hero = axis_label(hero, {date_col: ov_grain, credit_col: "Credits"})
+        safe_render_chart("area", hero, [ov_grain], ["Credits"], [svc_grp])
+
+    # -------------------------------------------------------------------------
+    # ROW 4: 3-Column Intelligence Panel
+    # -------------------------------------------------------------------------
+    col_l, col_m, col_r = st.columns(3)
+
+    with col_l:
+        st.markdown("#### Top Cost Drivers")
+        if not df_top.empty:
+            t_col = get_best_col(df_top, ["WAREHOUSE_NAME", "RESOURCE_NAME", "NAME"])
+            c_col_top = get_best_col(df_top, ["TOTAL_CREDITS", "CREDITS"])
+            if t_col and c_col_top:
+                top5 = df_top.nlargest(5, c_col_top)[[t_col, c_col_top]].copy()
+                # Blank axis titles so the chart reads cleanly
+                top5 = top5.rename(columns={t_col: "", c_col_top: " "})
+                safe_render_chart("bar", top5, [""], [" "])
+            else:
+                show_table(df_top.head(5))
+        else:
+            st.caption("No resource data available.")
+
+    with col_m:
+        st.markdown("#### ML Forecast (Next 7d)")
+        if not df_ml_fc.empty:
+            fc_7d = df_ml_fc.head(7).copy()
+            fc_plot = axis_label(fc_7d, {
+                "FORECAST_DATE": "Date",
+                "PREDICTED_CREDITS": "Predicted",
+                "PESSIMISTIC_SPEND": "Worst case",
+            })
+            safe_render_chart("area", fc_plot, ["Date"], ["Predicted", "Worst case"], multi_y=True)
+            st.caption(f"7-day predicted: {safe_num(fc_7d['PREDICTED_CREDITS'].sum()):,.2f} credits")
+        else:
+            st.caption("No forecast data. Train COST_FORECASTER to enable.")
+
+    with col_r:
+        st.markdown("#### Budget Health")
+        if not df_burn.empty and mtd_col:
+            latest_burn = df_burn.iloc[-1]
+            avg_rate = safe_num(latest_burn.get("AVG_DAILY_RATE", 0))
+            days_in_month = int(safe_num(latest_burn.get("DAYS_IN_MONTH", 30)) or 30)
+            days_remaining = int(safe_num(latest_burn.get("DAYS_REMAINING", 0)))
+            day_number = int(safe_num(latest_burn.get("DAY_NUMBER", 0)))
+            projected_eom_ov = safe_num(latest_burn.get("PROJECTED_EOM", mtd_spend))
+
+            # Budget derived from this month's own trend, rounded up to the nearest 10
+            budget_ov = int(((projected_eom_ov // 10) + 1) * 10) if projected_eom_ov > 0 else 50
+            burn_pct = min(100, int((mtd_spend / budget_ov) * 100)) if budget_ov > 0 else 0
+
+            # Runway is scoped to the current month only
+            raw_runway = int((budget_ov - mtd_spend) / avg_rate) if avg_rate > 0 else days_remaining
+            runway_in_month = max(0, min(raw_runway, days_remaining))
+            covers_month = raw_runway >= days_remaining
+
+            st.progress(burn_pct / 100)
+            st.caption(f"Day {day_number} of {days_in_month} — {burn_pct}% of the {budget_ov} cr target used")
+            st.metric(
+                "Runway (this month)",
+                f"{runway_in_month} of {days_remaining} days",
+                delta="Covers month end" if covers_month else "Runs out early",
+                delta_color="normal" if covers_month else "inverse",
+            )
+        else:
+            st.caption("No budget data available.")
+
+    # -------------------------------------------------------------------------
+    # ROW 5: Weekly Trends + AI vs Traditional Split
+    # -------------------------------------------------------------------------
+    col_w, col_ai = st.columns(2)
+
+    with col_w:
+        df_weekly = run_query("VW_WEEKLY_TRENDS")
+        if not df_weekly.empty:
+            wk_grain = drill_control("weekly_grain", default="Month", options=("Date", "Month", "Year"))
+            st.markdown(f"#### Weekly Trend by {wk_grain}")
+            c_col = get_best_col(df_weekly, ["CREDITS_USED", "TOTAL_CREDITS", "CREDITS"])
+            w_date = get_best_col(df_weekly, ["WEEK_START", "USAGE_DATE"])
+            wk = apply_drill(df_weekly, w_date, [c_col], wk_grain, group_col="SERVICE_TYPE", drill_key="weekly_grain")
+            wk = axis_label(wk, {w_date: wk_grain, c_col: "Credits", "SERVICE_TYPE": "Service"})
+            safe_render_chart("line", wk, [wk_grain], ["Credits"], ["Service"])
+
+    with col_ai:
+        st.markdown("#### AI vs Compute Spend Split")
+        if total_ai_credits > 0 and not df_service.empty and credit_col:
+            compute_credits = safe_num(df_service[credit_col].sum())
+            split_data = pd.DataFrame({
+                "Category": ["Warehouse / Compute", "AI / Cortex"],
+                "Credits": [compute_credits, total_ai_credits]
+            })
+            safe_render_chart("bar", split_data, ["Category"], ["Credits"])
+        else:
+            st.caption("Insufficient data for spend split analysis.")
+
+    # -------------------------------------------------------------------------
+    # ROW 6: Automated Insight Alerts
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("#### Governance Signals")
+    alerts_shown = 0
+
+    if not df_anomalies.empty:
+        st.warning(f"**{len(df_anomalies)} cost anomalies** detected in the analysis window. Review the Anomalies tab.")
+        alerts_shown += 1
+
+    if efficiency_score > 0 and efficiency_score < 60:
+        st.error(f"**Infrastructure efficiency at {efficiency_score:.0f}%** — below 60% target. Check Efficiency Score tab for waste sources.")
+        alerts_shown += 1
+    elif efficiency_score >= 60 and efficiency_score < 80:
+        st.warning(f"**Efficiency at {efficiency_score:.0f}%** — room for optimization. Target is 80+.")
+        alerts_shown += 1
+
+    if ai_pct > 30:
+        st.info(f"**AI workloads consuming {ai_pct:.1f}%** of total spend. Ensure guardrails are in place for experimental models.")
+        alerts_shown += 1
+
+    if wow_delta is not None and wow_delta > 25:
+        st.warning(f"**Spend accelerating +{wow_delta:.1f}% WoW.** Investigate new workloads or runaway queries.")
+        alerts_shown += 1
+
+    if alerts_shown == 0:
+        st.success("All governance indicators are within normal operating parameters.")
+
+
+# ==============================================================================
+# 2. WAREHOUSES
+# ==============================================================================
+with tab_warehouse:
+    st.markdown("### Warehouse Infrastructure Analytics")
+
+    df_wh = run_query("VW_WAREHOUSE_DAILY")
+    if not df_wh.empty:
+        wh_col = get_best_col(df_wh, ["WAREHOUSE_NAME", "NAME"])
+        credit_col = get_best_col(df_wh, ["CREDITS_USED", "TOTAL_CREDITS", "CREDITS"])
+        wh_date = get_best_col(df_wh, ["USAGE_DATE", "DATE"])
+
+        if wh_col:
+            fc1, fc2 = st.columns([2, 1])
+            with fc1:
+                warehouses = sorted(df_wh[wh_col].unique())
+                selected_wh = st.multiselect("Filter Warehouses", warehouses, default=warehouses[:5])
+            with fc2:
+                wh_grain = drill_control("wh_grain", default="Date")
+
+            filtered = df_wh[df_wh[wh_col].isin(selected_wh)].copy()
+
+            total_credits = safe_num(filtered[credit_col].sum()) if credit_col else 0.0
+            peak_day_val = 0.0
+            peak_wh = "—"
+            if credit_col and not filtered.empty:
+                peak_row_wh = filtered.loc[filtered[credit_col].idxmax()]
+                peak_day_val = safe_num(peak_row_wh[credit_col])
+                peak_wh = str(peak_row_wh[wh_col])[:20]
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Selected Spend", f"{total_credits:,.2f} cr", delta_color="inverse")
+            with col2:
+                st.metric("Warehouses Selected", f"{len(selected_wh)}")
+            with col3:
+                st.metric("Highest Single Day", f"{peak_day_val:,.2f} cr",
+                          delta=peak_wh, delta_color="off")
+            with col4:
+                avg_per_wh = total_credits / len(selected_wh) if selected_wh else 0
+                st.metric("Avg per Warehouse", f"{avg_per_wh:,.2f} cr", delta_color="inverse")
+
+            st.markdown(f"#### Warehouse Spend by {wh_grain}")
+            wh_chart = apply_drill(filtered, wh_date, [credit_col], wh_grain, group_col=wh_col, drill_key="wh_grain")
+            wh_chart = axis_label(wh_chart, {wh_date: wh_grain, credit_col: "Credits",
+                                             wh_col: "Warehouse"})
+            safe_render_chart("line", wh_chart, [wh_grain], ["Credits"], ["Warehouse"])
+
+    df_util = run_query("VW_WAREHOUSE_UTILIZATION")
+    if not df_util.empty:
+        col1, col2 = st.columns(2)
+        u_wh_col = get_best_col(df_util, ["WAREHOUSE_NAME", "NAME"])
+        with col1:
+            st.markdown("#### Average Utilization %")
+            u_col = get_best_col(df_util, ["UTILIZATION_PCT", "UTIL_PCT", "AVG_UTILIZATION"])
+            if u_wh_col and u_col:
+                avg_util = df_util.groupby(u_wh_col, as_index=False)[u_col].mean().round(1)
+                avg_util = avg_util.sort_values(u_col, ascending=False)
+                # Blank axis titles — the section heading already names the metric
+                avg_util_plot = avg_util.rename(columns={u_wh_col: "", u_col: " "})
+                safe_render_chart("bar", avg_util_plot, [""], [" "])
+        with col2:
+            st.markdown("#### Total Idle Hours Provisioned")
+            idle_col = get_best_col(df_util, ["IDLE_HOURS", "TOTAL_IDLE_HOURS"])
+            if u_wh_col and idle_col:
+                idle = df_util.groupby(u_wh_col, as_index=False)[idle_col].sum()
+                idle = idle.sort_values(idle_col, ascending=False)
+                idle_plot = idle.rename(columns={u_wh_col: "", idle_col: " "})
+                safe_render_chart("bar", idle_plot, [""], [" "])
+
+    col_m1, col_m2 = st.columns(2)
+    with col_m1:
+        df_mom = run_query("VW_WAREHOUSE_MOM")
+        if not df_mom.empty:
+            st.markdown("#### Month-over-Month Delta")
+            df_mom = fmt_month(df_mom, ["MONTH"])
+            sort_c = get_best_col(df_mom, ["CHANGE", "MOM_CHANGE", "CREDITS_CHANGE"])
+            mom_show = df_mom.sort_values(sort_c, ascending=False) if sort_c else df_mom
+            mom_show = axis_label(mom_show, {
+                "WAREHOUSE_NAME": "Warehouse", "MONTH": "Month",
+                "CREDITS": "Credits", "PREV_MONTH_CREDITS": "Prev Month",
+                "CHANGE": "Change",
+            })
+            show_table(mom_show)
+            st.caption("Change is month-over-month credit delta — red means spend increased.")
+    with col_m2:
+        df_top = run_query("VW_TOP_RESOURCES")
+        if not df_top.empty:
+            st.markdown("#### Top Resource Consumption")
+            sort_c = get_best_col(df_top, ["TOTAL_CREDITS", "CREDITS"])
+            show_table(df_top.sort_values(sort_c, ascending=False) if sort_c else df_top)
+
+
+# ==============================================================================
+# 3. USERS
+# ==============================================================================
+with tab_users:
+    st.markdown("### User Spend Attribution")
+
+    df_users = run_query("VW_USER_COSTS")
+    if not df_users.empty:
+        u_col = get_best_col(df_users, ["USER_NAME", "USER"])
+        c_col = get_best_col(df_users, ["TOTAL_CREDITS", "CREDITS_USED", "CREDITS"])
+
+        if u_col and c_col:
+            top_users_df = df_users.groupby(u_col, as_index=False)[c_col].sum().sort_values(c_col, ascending=False)
+            total_user_spend = safe_num(top_users_df[c_col].sum())
+            top_spender = top_users_df.iloc[0] if not top_users_df.empty else None
+            concentration = (safe_num(top_spender[c_col]) / total_user_spend * 100) if (
+                top_spender is not None and total_user_spend > 0) else 0.0
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Attributed Spend", f"{total_user_spend:,.2f} cr",
+                          delta="User-level attribution", delta_color="off")
+            with col2:
+                st.metric("Active Spenders", f"{len(top_users_df)}",
+                          delta="Distinct users", delta_color="off")
+            with col3:
+                st.metric("Top Spender",
+                          str(top_spender[u_col])[:20] if top_spender is not None else "—",
+                          delta=f"{safe_num(top_spender[c_col]):,.2f} cr" if top_spender is not None else "—",
+                          delta_color="off")
+            with col4:
+                st.metric("Spend Concentration", f"{concentration:,.1f} %",
+                          delta="Single-user dominated" if concentration > 50 else "Well distributed",
+                          delta_color="inverse" if concentration > 50 else "normal")
+
+            st.markdown("#### Top 15 Account Spenders")
+            top15 = axis_label(top_users_df.head(15), {u_col: "User", c_col: "Credits"})
+            safe_render_chart("bar", top15, ["User"], ["Credits"])
+
+            user_list = top_users_df[u_col].tolist()
+            fu1, fu2 = st.columns([2, 1])
+            with fu1:
+                user_filter = st.multiselect("Drill-down Users", user_list, default=user_list[:3])
+            with fu2:
+                usr_grain = drill_control("user_grain", default="Date")
+            if user_filter:
+                user_daily = df_users[df_users[u_col].isin(user_filter)].copy()
+                u_date = get_best_col(user_daily, ["USAGE_DATE", "DATE"])
+                st.markdown(f"#### Spender Trajectory by {usr_grain}")
+                traj = apply_drill(user_daily, u_date, [c_col], usr_grain, group_col=u_col, drill_key="user_grain")
+                traj = axis_label(traj, {u_date: usr_grain, c_col: "Credits", u_col: "User"})
+                safe_render_chart("line", traj, [usr_grain], ["Credits"], ["User"])
+
+    st.markdown("---")
+    st.markdown("### Most Expensive Queries This Month")
+
+    df_topq = run_query("VW_TOP_EXPENSIVE_QUERIES")
+    if not df_topq.empty:
+        df_topq = clean_dates(df_topq, ["QUERY_DATE"])
+        df_topq_sorted = df_topq.sort_values("ESTIMATED_CREDITS", ascending=False)
+        worst = df_topq_sorted.iloc[0]
+
+        # Who spent the most this month (aggregated by user)
+        by_user = df_topq.groupby("USER_NAME", as_index=False)["ESTIMATED_CREDITS"].sum().sort_values(
+            "ESTIMATED_CREDITS", ascending=False)
+        by_wh = df_topq.groupby("WAREHOUSE_NAME", as_index=False)["ESTIMATED_CREDITS"].sum().sort_values(
+            "ESTIMATED_CREDITS", ascending=False)
+
+        col_q1, col_q2, col_q3, col_q4 = st.columns(4)
+        with col_q1:
+            st.metric("Top Spender (Month)", by_user.iloc[0]["USER_NAME"],
+                      delta=f"{safe_num(by_user.iloc[0]['ESTIMATED_CREDITS']):.3f} cr", delta_color="off")
+        with col_q2:
+            st.metric("Costliest Single Query", f"{safe_num(worst['ESTIMATED_CREDITS']):.4f} cr")
+        with col_q3:
+            st.metric("Fired From Warehouse", str(worst["WAREHOUSE_NAME"])[:22])
+        with col_q4:
+            st.metric("Its Runtime", f"{safe_num(worst['ELAPSED_SECONDS']):,.1f}s")
+
+        col_qa, col_qb = st.columns(2)
+        with col_qa:
+            st.markdown("#### Spend by User")
+            by_user_plot = axis_label(by_user.head(10), {"USER_NAME": "User", "ESTIMATED_CREDITS": "Credits"})
+            safe_render_chart("bar", by_user_plot, ["User"], ["Credits"])
+        with col_qb:
+            st.markdown("#### Spend by Warehouse")
+            by_wh_plot = axis_label(by_wh.head(10), {"WAREHOUSE_NAME": "Warehouse", "ESTIMATED_CREDITS": "Credits"})
+            safe_render_chart("bar", by_wh_plot, ["Warehouse"], ["Credits"])
+
+        st.markdown("#### Costliest Query Detail")
+        display_cols = ["QUERY_DATE", "USER_NAME", "WAREHOUSE_NAME", "WAREHOUSE_SIZE",
+                        "ESTIMATED_CREDITS", "ELAPSED_SECONDS", "GB_SCANNED", "QUERY_TYPE", "EXECUTION_STATUS"]
+        if user_tier != "VIEWER":
+            display_cols.append("QUERY_SNIPPET")
+        else:
+            st.caption("SQL text redacted for VIEWER tier.")
+        avail = [c for c in display_cols if c in df_topq_sorted.columns]
+        show_table(axis_label(df_topq_sorted[avail].head(25), {
+            "QUERY_DATE": "Date", "USER_NAME": "User", "WAREHOUSE_NAME": "Warehouse",
+            "WAREHOUSE_SIZE": "Size", "ESTIMATED_CREDITS": "Credits",
+            "ELAPSED_SECONDS": "Runtime (s)", "GB_SCANNED": "GB Scanned",
+            "QUERY_TYPE": "Type", "EXECUTION_STATUS": "Status", "QUERY_SNIPPET": "SQL",
+        }))
+
+    st.markdown("---")
+    df_exp = run_query("VW_EXPENSIVE_QUERY_PATTERNS")
+    if not df_exp.empty:
+        st.markdown("#### Recurring Query Patterns (Aggregated by Signature)")
+        sort_c = get_best_col(df_exp, ["TOTAL_CREDITS", "CREDITS", "EXECUTION_COUNT"])
+        show_table(df_exp.nlargest(20, sort_c) if sort_c else df_exp)
+
+
+# ==============================================================================
+# 4. SERVERLESS
+# ==============================================================================
+with tab_serverless:
+    st.markdown("### Serverless Feature Consumption")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### Snowpipe Ingestion Costs")
+        df_pipe = run_query("VW_SNOWPIPE_COSTS")
+        if not df_pipe.empty:
+            p_col = get_best_col(df_pipe, ["PIPE_NAME", "NAME"])
+            c_col = get_best_col(df_pipe, ["TOTAL_CREDITS", "CREDITS"])
+            if p_col and c_col:
+                pipe_totals = df_pipe.groupby(p_col, as_index=False)[c_col].sum().sort_values(c_col, ascending=False)
+                pipe_plot = axis_label(pipe_totals.head(10), {p_col: "Pipe", c_col: "Credits"})
+                safe_render_chart("bar", pipe_plot, ["Pipe"], ["Credits"])
+                show_table(pipe_plot)
+        else:
+            st.caption("No Snowpipe ingestion spend detected.")
+
+    with col2:
+        st.markdown("#### Automatic Clustering")
+        df_clust = run_query("VW_CLUSTERING_COSTS")
+        if not df_clust.empty:
+            show_table(clean_dates(df_clust).head(10))
+        else:
+            st.caption("No automatic clustering spend detected.")
+
+    col3, col4 = st.columns(2)
+    with col3:
+        st.markdown("#### Materialized View Maintenance")
+        df_mv = run_query("VW_MATERIALIZED_VIEW_COSTS")
+        if not df_mv.empty:
+            show_table(clean_dates(df_mv).head(10))
+        else:
+            st.caption("No materialized view refresh spend detected.")
+    with col4:
+        st.markdown("#### Search Optimization Service (SOS)")
+        df_sos = run_query("VW_SEARCH_OPTIMIZATION_COSTS")
+        if not df_sos.empty:
+            show_table(clean_dates(df_sos))
+        else:
+            st.caption("No Search Optimization Service spend detected.")
+
+
+# ==============================================================================
+# 5. STORAGE
+# ==============================================================================
+with tab_storage:
+    st.markdown("### Storage Analytics")
+
+    df_storage = run_query("VW_STORAGE_DAILY")
+    if not df_storage.empty:
+        d_col = get_best_col(df_storage, ["USAGE_DATE", "DATE"])
+        gb_col = get_best_col(df_storage, ["TOTAL_GB", "STORAGE_GB", "GB"])
+        db_col = get_best_col(df_storage, ["DATABASE_NAME", "NAME"])
+
+        if d_col and gb_col:
+            max_storage_date = df_storage[d_col].max()
+            latest = df_storage[df_storage[d_col] == max_storage_date]
+            total_gb = safe_num(latest[gb_col].sum())
+
+            # Growth vs the earliest snapshot in the window
+            first_date = df_storage[d_col].min()
+            first_gb = safe_num(df_storage[df_storage[d_col] == first_date][gb_col].sum())
+            growth_pct = ((total_gb - first_gb) / first_gb * 100) if first_gb > 0 else 0.0
+            largest_db = latest.loc[latest[gb_col].idxmax()] if (db_col and not latest.empty) else None
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Provisioned Storage", f"{total_gb:,.1f} GB",
+                          delta=f"{total_gb / 1024:,.2f} TB", delta_color="off")
+            with col2:
+                st.metric("Tracked Databases", f"{latest[db_col].nunique() if db_col else len(latest)}",
+                          delta=f"As of {max_storage_date}", delta_color="off")
+            with col3:
+                st.metric("Growth in Window", f"{growth_pct:+,.1f} %",
+                          delta="Expanding" if growth_pct > 0 else "Stable or shrinking",
+                          delta_color="inverse" if growth_pct > 0 else "normal")
+            with col4:
+                st.metric("Largest Database",
+                          str(largest_db[db_col])[:20] if largest_db is not None else "—",
+                          delta=f"{safe_num(largest_db[gb_col]):,.1f} GB" if largest_db is not None else "—",
+                          delta_color="off")
+
+            stg_grain = drill_control("storage_grain", default="Date")
+            st.markdown(f"#### Storage Volume by {stg_grain}")
+            if db_col:
+                top_dbs = df_storage.groupby(db_col)[gb_col].max().nlargest(10).index.tolist()
+                filtered_s = df_storage[df_storage[db_col].isin(top_dbs)]
+                stg_chart = apply_drill(filtered_s, d_col, [gb_col], stg_grain, agg="max", group_col=db_col, drill_key="storage_grain")
+                stg_chart = axis_label(stg_chart, {d_col: stg_grain, gb_col: "Storage (GB)", db_col: "Database"})
+                safe_render_chart("area", stg_chart, [stg_grain], ["Storage (GB)"], ["Database"])
+            else:
+                stg_chart = apply_drill(df_storage, d_col, [gb_col], stg_grain, agg="max", drill_key="storage_grain")
+                stg_chart = axis_label(stg_chart, {d_col: stg_grain, gb_col: "Storage (GB)"})
+                safe_render_chart("area", stg_chart, [stg_grain], ["Storage (GB)"])
+
+            st.markdown("#### Database Storage Breakdown")
+            show_table(axis_label(latest.sort_values(gb_col, ascending=False), {
+                d_col: "Date", db_col: "Database", gb_col: "Storage (GB)",
+            }))
+
+
+# ==============================================================================
+# 6. QUERY PERFORMANCE
+# ==============================================================================
+with tab_perf:
+    st.markdown("### Query Performance & Bottlenecks")
+
+    df_perf = run_query("VW_QUERY_PERFORMANCE")
+    if not df_perf.empty:
+        q_date = get_best_col(df_perf, ["QUERY_DATE", "USAGE_DATE", "DATE"])
+        q_tot = get_best_col(df_perf, ["TOTAL_QUERIES", "QUERY_COUNT"])
+        q_fail = get_best_col(df_perf, ["FAILED_QUERIES", "FAILURES"])
+        q_spill = get_best_col(df_perf, ["TOTAL_GB_SPILLED", "SPILLED_GB"])
+
+        if q_date and q_tot:
+            totals = df_perf.groupby(q_date, as_index=False).agg({
+                col: "sum" for col in [q_tot, q_fail, q_spill] if col and col in df_perf.columns
+            })
+            total_q = safe_num(totals[q_tot].sum())
+            total_fail = safe_num(totals[q_fail].sum()) if (q_fail and q_fail in totals) else 0.0
+            total_spill = safe_num(totals[q_spill].sum()) if (q_spill and q_spill in totals) else 0.0
+            fail_rate = (total_fail / total_q * 100) if total_q > 0 else 0.0
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Query Volume", f"{total_q:,.0f}",
+                          delta=f"{len(totals)} day(s)", delta_color="off")
+            with col2:
+                st.metric("Failed Queries", f"{total_fail:,.0f}",
+                          delta=f"{fail_rate:.2f}% failure rate",
+                          delta_color="inverse" if fail_rate > 1 else "normal")
+            with col3:
+                st.metric("Disk Spilling", f"{total_spill:,.1f} GB",
+                          delta="Undersized compute" if total_spill > 0 else "No spilling",
+                          delta_color="inverse" if total_spill > 0 else "normal")
+            with col4:
+                avg_daily_q = total_q / len(totals) if len(totals) else 0
+                st.metric("Avg Daily Volume", f"{avg_daily_q:,.0f}",
+                          delta="Queries per day", delta_color="off")
+
+            perf_grain = drill_control("perf_grain", default="Date")
+            st.markdown(f"#### Query Execution Volume by {perf_grain}")
+            perf_chart = apply_drill(totals, q_date, [q_tot], perf_grain, drill_key="perf_grain")
+            perf_chart = axis_label(perf_chart, {q_date: perf_grain, q_tot: "Queries"})
+            safe_render_chart("line", perf_chart, [perf_grain], ["Queries"])
+
+    df_queue = run_query("VW_QUEUE_TIMES")
+    if not df_queue.empty:
+        st.markdown("#### Queue Latency by Warehouse")
+        show_table(clean_dates(df_queue))
+
+    col_s1, col_s2 = st.columns(2)
+    with col_s1:
+        df_scans = run_query("VW_FULL_TABLE_SCANS")
+        if not df_scans.empty:
+            st.markdown(f"#### Full Table Scans ({len(df_scans)} queries)")
+            show_table(clean_dates(df_scans).head(15))
+    with col_s2:
+        df_spill = run_query("VW_SPILLING_QUERIES")
+        if not df_spill.empty:
+            st.markdown(f"#### Queries Spilling to Disk ({len(df_spill)} queries)")
+            show_table(clean_dates(df_spill).head(15))
+
+
+# ==============================================================================
+# 7. CONTAINERS (SPCS) — Control Center
+# ==============================================================================
+with tab_containers:
+    st.markdown("### SPCS Control Center")
+    st.caption("Snowpark Container Services is typically the largest cost driver — pools bill continuously while active.")
+
+    df_spcs = run_query("VW_SPCS_SERVICE_COSTS")
+
+    if not df_spcs.empty:
+        df_spcs = clean_dates(df_spcs, ["USAGE_DATE", "LAST_ACTIVE_DATE"])
+
+        workload_summary = df_spcs.groupby(
+            ["COMPUTE_POOL_NAME", "WORKLOAD_NAME"], as_index=False
+        ).agg({
+            "LIFETIME_CREDITS": "max",
+            "LIFETIME_HOURS": "max",
+            "ACTIVE_DAYS": "max",
+            "AVG_DAILY_CREDITS": "max",
+            "PROJECTED_MONTHLY_CREDITS": "max",
+            "LAST_ACTIVE_DATE": "max",
+        }).sort_values("LIFETIME_CREDITS", ascending=False)
+
+        total_lifetime = safe_num(workload_summary["LIFETIME_CREDITS"].sum())
+        total_projected = safe_num(workload_summary["PROJECTED_MONTHLY_CREDITS"].sum())
+        top_wl = workload_summary.iloc[0]
+
+        # All four cards carry a numeric value + text delta so they stay symmetric
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Lifetime SPCS Credits", f"{total_lifetime:,.2f} cr",
+                      delta=f"{len(workload_summary)} workload(s)", delta_color="off")
+        with col2:
+            st.metric("Projected Monthly", f"{total_projected:,.1f} cr",
+                      delta="At current rate", delta_color="inverse")
+        with col3:
+            st.metric("Top Consumer Spend", f"{safe_num(top_wl['LIFETIME_CREDITS']):,.2f} cr",
+                      delta=str(top_wl["WORKLOAD_NAME"])[:22], delta_color="off")
+        with col4:
+            st.metric("Avg Daily Burn", f"{safe_num(workload_summary['AVG_DAILY_CREDITS'].sum()):,.2f} cr",
+                      delta="Per active day", delta_color="off")
+
+        st.markdown("#### Cost Attribution by Workload")
+        show_table(axis_label(workload_summary, {
+            "COMPUTE_POOL_NAME": "Compute Pool", "WORKLOAD_NAME": "Workload",
+            "LIFETIME_CREDITS": "Lifetime Credits", "LIFETIME_HOURS": "Lifetime Hours",
+            "ACTIVE_DAYS": "Active Days", "AVG_DAILY_CREDITS": "Avg Daily Credits",
+            "PROJECTED_MONTHLY_CREDITS": "Projected Monthly", "LAST_ACTIVE_DATE": "Last Active",
+        }))
+
+        spcs_grain = drill_control("spcs_grain", default="Date")
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.markdown(f"#### Consumption by {spcs_grain}")
+            trend = apply_drill(df_spcs, "USAGE_DATE", ["DAILY_CREDITS"], spcs_grain, drill_key="spcs_grain")
+            trend = axis_label(trend, {"USAGE_DATE": spcs_grain, "DAILY_CREDITS": "Credits"})
+            safe_render_chart("area", trend, [spcs_grain], ["Credits"])
+        with col_c2:
+            st.markdown("#### Lifetime Credits by Pool")
+            pool_plot = axis_label(workload_summary, {
+                "COMPUTE_POOL_NAME": "Compute Pool", "LIFETIME_CREDITS": "Credits"})
+            safe_render_chart("bar", pool_plot, ["Compute Pool"], ["Credits"])
+    else:
+        st.caption("No Container Service usage detected.")
+
+    # -------------------------------------------------------------------------
+    # HUMAN-IN-LOOP SERVICE CONTROL
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("### Live Service Control")
+
+    if user_tier == "VIEWER":
+        st.info("Service control operations require DATA_ENGINEER or FINOPS_ADMIN role.")
+    else:
+        _conn = st.connection("snowflake")
+
+        df_pools = None
+        df_services = None
+
+        try:
+            df_pools = _conn.query("SHOW COMPUTE POOLS")
+        except Exception:
+            pass
+
+        try:
+            df_services = _conn.query("SHOW SERVICES IN ACCOUNT")
+        except Exception:
+            pass
+
+        # Fallback: if SHOW returned empty, try querying our usage view for pool names
+        if (df_pools is None or df_pools.empty) and not df_spcs.empty:
+            pool_names = df_spcs["COMPUTE_POOL_NAME"].unique().tolist()
+            df_pools = pd.DataFrame({"name": pool_names, "state": ["UNKNOWN"] * len(pool_names),
+                                     "active_nodes": ["-"] * len(pool_names)})
+            st.caption("Live pool status unavailable inside SPCS — showing known pools from metering history.")
+        if (df_services is None or df_services.empty) and not df_spcs.empty:
+            workloads = df_spcs[["COMPUTE_POOL_NAME", "WORKLOAD_NAME"]].drop_duplicates().values.tolist()
+            df_services = pd.DataFrame({
+                "name": [w[1] for w in workloads],
+                "database_name": [""] * len(workloads),
+                "schema_name": [""] * len(workloads),
+                "status": ["SEE METERING DATA"] * len(workloads),
+                "compute_pool": [w[0] for w in workloads],
+            })
+            st.caption("Live service status unavailable inside SPCS — showing known workloads from metering history.")
+
+
+        st.markdown("#### Compute Pools")
+        if df_pools is not None and not df_pools.empty:
+            pool_name_col = "name" if "name" in df_pools.columns else df_pools.columns[0]
+            pool_state_col = "state" if "state" in df_pools.columns else None
+
+            for _, pool in df_pools.iterrows():
+                p_name = str(pool.get(pool_name_col, ""))
+                p_state = str(pool.get(pool_state_col, "UNKNOWN")) if pool_state_col else "UNKNOWN"
+                p_nodes = pool.get("active_nodes", "-")
+
+                pc1, pc2, pc3 = st.columns([3, 1, 1])
+                with pc1:
+                    st.write(f"**{p_name}** — state: `{p_state}` | active nodes: `{p_nodes}`")
+                with pc2:
+                    st.caption(f"{p_state}")
+                with pc3:
+                    if p_state.upper() in ("ACTIVE", "IDLE", "STARTING"):
+                        confirm_key = f"cfm_pool_{p_name}"
+                        if st.checkbox("Confirm", key=confirm_key, help=f"Confirm suspend of {p_name}"):
+                            if st.button("Suspend Pool", key=f"sus_pool_{p_name}", type="primary"):
+                                try:
+                                    _conn.query(f"ALTER COMPUTE POOL {p_name} SUSPEND")
+                                    st.success(f"Compute pool {p_name} suspended.")
+                                    st.rerun()
+                                except Exception as ex:
+                                    st.error(f"Suspend failed: {ex}")
+                    elif p_state.upper() == "SUSPENDED":
+                        if st.button("Resume", key=f"res_pool_{p_name}"):
+                            try:
+                                _conn.query(f"ALTER COMPUTE POOL {p_name} RESUME")
+                                st.success(f"Compute pool {p_name} resumed.")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"Resume failed: {ex}")
+        else:
+            st.caption("No compute pools visible to the current role.")
+
+        st.markdown("#### Services")
+        if df_services is not None and not df_services.empty:
+            svc_name_col = "name" if "name" in df_services.columns else df_services.columns[0]
+            svc_db_col = "database_name" if "database_name" in df_services.columns else None
+            svc_sch_col = "schema_name" if "schema_name" in df_services.columns else None
+            svc_status_col = None
+            for cand in ["status", "state", "service_status"]:
+                if cand in df_services.columns:
+                    svc_status_col = cand
+                    break
+
+            for _, svc in df_services.iterrows():
+                s_name = str(svc.get(svc_name_col, ""))
+                s_db = str(svc.get(svc_db_col, "")) if svc_db_col else ""
+                s_sch = str(svc.get(svc_sch_col, "")) if svc_sch_col else ""
+                s_status = str(svc.get(svc_status_col, "UNKNOWN")) if svc_status_col else "UNKNOWN"
+                fqn = ".".join([p for p in [s_db, s_sch, s_name] if p and p != "None"])
+
+                sc1, sc2 = st.columns([4, 1])
+                with sc1:
+                    st.write(f"**{s_name}** — `{s_status}`")
+                    st.caption(fqn)
+                with sc2:
+                    ck = f"cfm_svc_{fqn}"
+                    if st.checkbox("Confirm", key=ck, help=f"Confirm suspend of {s_name}"):
+                        if st.button("Suspend", key=f"sus_svc_{fqn}", type="primary"):
+                            try:
+                                _conn.query(f"ALTER SERVICE {fqn} SUSPEND")
+                                st.success(f"Service {s_name} suspended.")
+                                st.rerun()
+                            except Exception as ex:
+                                st.error(f"Suspend failed: {ex}")
+        else:
+            st.caption("No services visible to the current role.")
+
+    df_transfer = run_query("VW_DATA_TRANSFER")
+    if not df_transfer.empty:
+        st.markdown("---")
+        st.markdown("#### Data Transfer & Egress")
+        show_table(clean_dates(df_transfer))
+
+
+# ==============================================================================
+# 9. EFFICIENCY SCORE
+# ==============================================================================
+with tab_waste:
+    st.markdown("### Efficiency Scorecard")
+
+    df_waste = run_query("VW_WASTE_SCORE")
+    if not df_waste.empty:
+        s_col = get_best_col(df_waste, ["EFFICIENCY_SCORE", "SCORE"])
+        if s_col:
+            avg_score = safe_num(df_waste[s_col].mean())
+            worst_wh = df_waste.nsmallest(1, s_col).iloc[0]
+
+            col_w1, col_w2, col_w3, col_w4 = st.columns(4)
+            with col_w1:
+                st.metric("Infrastructure Efficiency", f"{avg_score:,.0f} /100",
+                          delta="Healthy" if avg_score >= 80 else ("Needs attention" if avg_score >= 60 else "Critical"),
+                          delta_color="normal" if avg_score >= 70 else "inverse")
+            with col_w2:
+                st.metric("Warehouses Scored", f"{len(df_waste)}",
+                          delta="In scope", delta_color="off")
+            with col_w3:
+                st.metric("Lowest Scorer", str(worst_wh.get("WAREHOUSE_NAME", "-"))[:20],
+                          delta=f"{safe_num(worst_wh[s_col]):,.0f} /100", delta_color="inverse")
+            with col_w4:
+                below = int((pd.to_numeric(df_waste[s_col], errors="coerce") < 60).sum())
+                st.metric("Below Target", f"{below}",
+                          delta="Remediate first" if below > 0 else "All above 60",
+                          delta_color="inverse" if below > 0 else "normal")
+            st.progress(min(100, max(0, int(avg_score))) / 100)
+
+        with st.expander("How is the Efficiency Score calculated?", expanded=False):
+            st.markdown("""
+The score starts at **100** and deducts points for each inefficiency signal detected
+over the trailing 14 days. Five factors are measured:
+
+| Factor | What it measures | Why it costs money | How to improve |
+|---|---|---|---|
+| **Utilization %** | How much of the provisioned compute is actually doing work | Low utilization means you pay for idle capacity | Lower `AUTO_SUSPEND` (60s), consolidate small warehouses, or downsize |
+| **Cache Miss %** | Share of queries that could not reuse the warehouse's local disk cache | Every cache miss re-reads from remote storage — slower and more credits | Keep related workloads on the same warehouse; avoid frequent suspend/resume cycles |
+| **Full Scan %** | Queries reading every micro-partition instead of pruning | Scanning the whole table burns compute unnecessarily | Add clustering keys on filter columns, or enable Search Optimization for point lookups |
+| **Spill %** | Queries spilling intermediate results to local or remote disk | Spilling to remote storage can be 10x slower and multiplies runtime cost | Increase warehouse size for those workloads, or reduce join/sort cardinality |
+| **Queue %** | Queries waiting for a slot before executing | Queued time signals under-provisioning; users retry and duplicate load | Enable multi-cluster scaling, or move batch jobs off the interactive warehouse |
+
+**Reading the score**
+
+- **80–100** — Healthy. Compute is well matched to the workload.
+- **60–79** — Room for optimization. Usually one dominant factor (often utilization or full scans).
+- **Below 60** — Critical. Investigate the lowest-scoring warehouse first; the columns in the
+  matrix below show which factor is dragging it down.
+
+**Where to act first:** sort the matrix by `CREDITS_14D` descending, then fix the highest-spend
+warehouse with the worst score. Optimizing a warehouse that costs 0.1 credits saves nothing.
+            """)
+
+        st.markdown("#### Warehouse Efficiency Matrix")
+        sort_col = get_best_col(df_waste, ["CREDITS_14D", "TOTAL_CREDITS", "CREDITS"])
+        display_waste = df_waste.sort_values(sort_col, ascending=False) if sort_col else df_waste
+        show_table(display_waste)
+
+        st.markdown("#### Factor Comparison Across Warehouses")
+        factor_cols = [c for c in ["UTILIZATION_PCT", "CACHE_MISS_PCT", "FULL_SCAN_PCT", "SPILL_PCT", "QUEUE_PCT"]
+                       if c in df_waste.columns]
+        if factor_cols and "WAREHOUSE_NAME" in df_waste.columns:
+            factor_plot = axis_label(df_waste, {
+                "WAREHOUSE_NAME": "Warehouse", "UTILIZATION_PCT": "Utilization %",
+                "CACHE_MISS_PCT": "Cache Miss %", "FULL_SCAN_PCT": "Full Scan %",
+                "SPILL_PCT": "Spill %", "QUEUE_PCT": "Queue %",
+            })
+            factor_labels = [c for c in ["Utilization %", "Cache Miss %", "Full Scan %", "Spill %", "Queue %"]
+                             if c in factor_plot.columns]
+            safe_render_chart("bar", factor_plot, ["Warehouse"], factor_labels, multi_y=True)
+
+    st.markdown("---")
+    st.markdown("#### User Execution Efficiency")
+    df_user_waste = run_query("VW_USER_WASTE_SCORE")
+    if not df_user_waste.empty:
+        u_sort = get_best_col(df_user_waste, ["EFFICIENCY_SCORE", "SCORE"])
+        show_table(df_user_waste.sort_values(u_sort) if u_sort else df_user_waste)
+    else:
+        st.caption("No user efficiency data available.")
+
+
+# ==============================================================================
+# 10. BUDGET BURN-DOWN
+# ==============================================================================
+with tab_burndown:
+    st.markdown("### Budget Burn-Down & Allocation")
+
+    df_burn = run_query("VW_BUDGET_BURNDOWN")
+    df_rate = run_query("VW_BUDGET_BURN_RATE")
+
+    if not df_burn.empty:
+        mtd_col = get_best_col(df_burn, ["MTD_CREDITS", "MTD_SPEND"])
+        if mtd_col:
+            latest = df_burn.iloc[-1]
+            mtd = safe_num(latest[mtd_col])
+            avg_rate = safe_num(latest.get("AVG_DAILY_RATE", 1.0))
+            projected_eom = safe_num(latest.get("PROJECTED_EOM", mtd))
+            days_remaining = safe_num(latest.get("DAYS_REMAINING", 0))
+
+            # Auto-derive the budget from actual trend, rounded up to the nearest 10
+            derived_budget = int(((projected_eom // 10) + 1) * 10) if projected_eom > 0 else 50
+
+            st.caption(
+                f"Baseline derived from your own consumption trend: projected end-of-month is "
+                f"**{projected_eom:,.1f} credits** at the current daily rate of {avg_rate:,.2f}."
+            )
+            monthly_budget = st.slider(
+                "Allocation Target (Credits)",
+                min_value=10,
+                max_value=max(500, derived_budget * 3),
+                value=derived_budget,
+                step=10,
+                help="Defaults to your trend-based projection. Adjust in steps of 10 to model a tighter or looser cap."
+            )
+
+            budget_remaining = monthly_budget - mtd
+            burn_pct = min(100, int((mtd / monthly_budget) * 100)) if monthly_budget > 0 else 0
+            will_overrun = projected_eom > monthly_budget
+            # Runway is capped to the days actually left in the month
+            raw_runway_bd = int(budget_remaining / avg_rate) if avg_rate > 0 else int(days_remaining)
+            runway_bd = max(0, min(raw_runway_bd, int(days_remaining)))
+            covers_month_bd = raw_runway_bd >= days_remaining
+            headroom_healthy = budget_remaining > 0
+
+            col_b1, col_b2, col_b3, col_b4 = st.columns(4)
+            with col_b1:
+                st.metric("MTD Consumption", f"{mtd:,.2f} cr",
+                          delta=f"{avg_rate:,.2f} cr/day", delta_color="inverse")
+            with col_b2:
+                st.metric("Budget Utilization", f"{burn_pct}%",
+                          delta="On track" if burn_pct < 85 else "High usage",
+                          delta_color="normal" if burn_pct < 85 else "inverse")
+            with col_b3:
+                st.metric("Runway (this month)", f"{runway_bd} of {int(days_remaining)} days",
+                          delta="Covers month end" if covers_month_bd else "Runs out early",
+                          delta_color="normal" if covers_month_bd else "inverse")
+            with col_b4:
+                st.metric("Projected End-of-Month", f"{projected_eom:,.1f} cr",
+                          delta="Over budget" if will_overrun else "Within budget",
+                          delta_color="inverse" if will_overrun else "normal")
+
+            st.progress(burn_pct / 100)
+            st.caption(f"Day {int(safe_num(latest.get('DAY_NUMBER', 0)))} of "
+                       f"{int(safe_num(latest.get('DAYS_IN_MONTH', 30)))} — {burn_pct}% of target consumed")
+
+            if will_overrun:
+                overshoot = projected_eom - monthly_budget
+                st.error(
+                    f"At the current rate you will exceed the allocation by **{overshoot:,.1f} credits**. "
+                    f"Reduce daily burn below {(monthly_budget - mtd) / max(days_remaining, 1):,.2f} cr/day to stay within target."
+                )
+            else:
+                st.success(f"On track — projected to finish {monthly_budget - projected_eom:,.1f} credits under allocation.")
+
+            df_burn_chart = clean_dates(df_burn.copy(), ["USAGE_DATE"])
+            df_burn_chart["ALLOCATION_TARGET"] = monthly_budget
+
+            bd_grain = drill_control("burn_grain", default="Date")
+            st.markdown(f"#### Cumulative Spend vs Allocation Target by {bd_grain}")
+            bd_chart = apply_drill(df_burn_chart, "USAGE_DATE", [mtd_col], bd_grain, agg="max", drill_key="burn_grain")
+            if "ALLOCATION_TARGET" not in bd_chart.columns:
+                bd_chart["ALLOCATION_TARGET"] = monthly_budget
+            bd_chart = axis_label(bd_chart, {
+                "USAGE_DATE": bd_grain, mtd_col: "Cumulative Credits",
+                "ALLOCATION_TARGET": "Target",
+            })
+            safe_render_chart("line", bd_chart, [bd_grain],
+                              ["Cumulative Credits", "Target"], multi_y=True)
+
+            st.markdown("#### Daily Consumption Detail")
+            show_table(axis_label(
+                df_burn_chart.sort_values("USAGE_DATE", ascending=False),
+                {"USAGE_DATE": "Date", "DAILY_CREDITS": "Daily Credits",
+                 mtd_col: "MTD Credits", "DAY_NUMBER": "Day",
+                 "DAYS_IN_MONTH": "Days in Month", "DAYS_REMAINING": "Days Left",
+                 "AVG_DAILY_RATE": "Avg Daily Rate", "PROJECTED_EOM": "Projected EOM",
+                 "ALLOCATION_TARGET": "Target"}
+            ))
+
+    if not df_rate.empty:
+        st.markdown("#### Hourly Consumption Velocity")
+        show_table(clean_dates(df_rate, keep_time=True))
+
+
+# ==============================================================================
+# 11. REMEDIATION CONSOLE
+# ==============================================================================
+with tab_remediation:
+    st.markdown("### Remediation & Action Console")
+
+    if user_tier == "VIEWER":
+        st.info("Read-only view. State changes require DATA_ENGINEER or FINOPS_ADMIN role.")
+
+    _conn = st.connection("snowflake")
+
+    def pick(row, *names):
+        """Reads a value from a SHOW result row regardless of column casing."""
+        for n in names:
+            for variant in (n, n.lower(), n.upper()):
+                if variant in row.index:
+                    val = row[variant]
+                    if val is not None:
+                        return val
+        return None
+
+    st.markdown("#### Warehouse Fleet Status")
+    df_wh_status = None
+    try:
+        df_wh_status = _conn.query("SHOW WAREHOUSES")
+    except Exception as ex:
+        st.error(f"Unable to read warehouse state: {ex}")
+
+    if df_wh_status is not None and not df_wh_status.empty:
+        started = 0
+        suspended = 0
+        long_suspend = []
+
+        for _, wh in df_wh_status.iterrows():
+            state = str(pick(wh, "state") or "").upper()
+            if state == "STARTED":
+                started += 1
+            elif state == "SUSPENDED":
+                suspended += 1
+            asp = pick(wh, "auto_suspend")
+            try:
+                if asp is not None and float(asp) > 120:
+                    long_suspend.append((str(pick(wh, "name")), int(float(asp))))
+            except Exception:
+                pass
+
+        cs1, cs2, cs3 = st.columns(3)
+        with cs1:
+            st.metric("Total Warehouses", len(df_wh_status))
+        with cs2:
+            st.metric("Currently Running", started,
+                      delta="Billing now" if started > 0 else "All idle",
+                      delta_color="inverse" if started > 0 else "normal")
+        with cs3:
+            st.metric("Suspended", suspended)
+
+        st.markdown("")
+        for _, wh in df_wh_status.iterrows():
+            wh_name = str(pick(wh, "name") or "")
+            wh_state = str(pick(wh, "state") or "UNKNOWN").upper()
+            wh_size = str(pick(wh, "size") or "-")
+            wh_asp = pick(wh, "auto_suspend")
+            wh_running = pick(wh, "running")
+            wh_queued = pick(wh, "queued")
+
+            if not wh_name:
+                continue
+
+            badge = "RUNNING" if wh_state == "STARTED" else wh_state
+            ca, cb, cc = st.columns([4, 2, 1])
+            with ca:
+                st.write(f"**{wh_name}** — `{badge}`")
+                st.caption(
+                    f"Size: {wh_size} | Auto-suspend: {wh_asp}s | "
+                    f"Running: {wh_running} | Queued: {wh_queued}"
+                )
+            with cb:
+                if wh_state == "STARTED":
+                    st.caption("Consuming credits")
+                else:
+                    st.caption("No cost while suspended")
+            with cc:
+                if user_tier == "VIEWER":
+                    st.caption("—")
+                elif wh_state == "STARTED":
+                    if st.button("Suspend", key=f"sus_wh_{wh_name}", type="primary"):
+                        try:
+                            _conn.query(f"ALTER WAREHOUSE {wh_name} SUSPEND")
+                            st.success(f"Suspended {wh_name}")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Failed: {ex}")
+                else:
+                    if st.button("Resume", key=f"res_wh_{wh_name}"):
+                        try:
+                            _conn.query(f"ALTER WAREHOUSE {wh_name} RESUME")
+                            st.success(f"Resumed {wh_name}")
+                            st.rerun()
+                        except Exception as ex:
+                            st.error(f"Failed: {ex}")
+    else:
+        st.caption("No warehouses visible to the current role.")
+
+    # -------------------------------------------------------------------------
+    # Actionable recommendations derived from the efficiency + sizing views
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+    st.markdown("#### Recommended Actions")
+
+    rec_rows = []
+
+    df_waste_rec = run_query("VW_WASTE_SCORE")
+    if not df_waste_rec.empty:
+        for _, r in df_waste_rec.iterrows():
+            wh = str(r.get("WAREHOUSE_NAME", ""))
+            score = safe_num(r.get("EFFICIENCY_SCORE", 100))
+            util = safe_num(r.get("UTILIZATION_PCT", 100))
+            spill = safe_num(r.get("SPILL_PCT", 0))
+            scan = safe_num(r.get("FULL_SCAN_PCT", 0))
+            queue = safe_num(r.get("QUEUE_PCT", 0))
+            credits = safe_num(r.get("CREDITS_14D", 0))
+
+            if util < 20 and credits > 0:
+                rec_rows.append({
+                    "TARGET": wh, "SIGNAL": f"Utilization {util:.1f}%",
+                    "RECOMMENDATION": "Lower AUTO_SUSPEND to 60s or downsize one tier",
+                    "SQL": f"ALTER WAREHOUSE {wh} SET AUTO_SUSPEND = 60;",
+                    "CREDITS_14D": credits,
+                })
+            if spill > 5:
+                rec_rows.append({
+                    "TARGET": wh, "SIGNAL": f"Spilling {spill:.1f}%",
+                    "RECOMMENDATION": "Increase warehouse size to stop remote spilling",
+                    "SQL": f"ALTER WAREHOUSE {wh} SET WAREHOUSE_SIZE = 'MEDIUM';",
+                    "CREDITS_14D": credits,
+                })
+            if scan > 50:
+                rec_rows.append({
+                    "TARGET": wh, "SIGNAL": f"Full scans {scan:.1f}%",
+                    "RECOMMENDATION": "Add clustering keys or enable Search Optimization on hot tables",
+                    "SQL": "-- Review Query Performance tab for the specific tables",
+                    "CREDITS_14D": credits,
+                })
+            if queue > 10:
+                rec_rows.append({
+                    "TARGET": wh, "SIGNAL": f"Queueing {queue:.1f}%",
+                    "RECOMMENDATION": "Enable multi-cluster scaling to absorb concurrency",
+                    "SQL": f"ALTER WAREHOUSE {wh} SET MAX_CLUSTER_COUNT = 3;",
+                    "CREDITS_14D": credits,
+                })
+
+    df_spcs_rec = run_query("VW_SPCS_SERVICE_COSTS")
+    if not df_spcs_rec.empty:
+        pools = df_spcs_rec.groupby("COMPUTE_POOL_NAME", as_index=False)["LIFETIME_CREDITS"].max()
+        for _, p in pools.iterrows():
+            rec_rows.append({
+                "TARGET": str(p["COMPUTE_POOL_NAME"]),
+                "SIGNAL": f"{safe_num(p['LIFETIME_CREDITS']):,.1f} lifetime credits",
+                "RECOMMENDATION": "Largest cost driver — suspend when idle via the Containers tab",
+                "SQL": f"ALTER COMPUTE POOL {p['COMPUTE_POOL_NAME']} SUSPEND;",
+                "CREDITS_14D": safe_num(p["LIFETIME_CREDITS"]),
+            })
+
+    if rec_rows:
+        df_rec = pd.DataFrame(rec_rows).sort_values("CREDITS_14D", ascending=False)
+        show_table(axis_label(df_rec, {
+            "TARGET": "Target", "SIGNAL": "Signal", "RECOMMENDATION": "Recommended Action",
+            "SQL": "SQL", "CREDITS_14D": "Credits (14d)",
+        }))
+        st.caption("Ordered by spend impact. Copy the SQL column to apply a change manually, or use the controls above.")
+    else:
+        st.success("No remediation actions required — all monitored resources are within efficiency targets.")
+
+
+# ==============================================================================
+# 12. COST VELOCITY
+# ==============================================================================
+with tab_velocity:
+    st.markdown("### Cost Velocity & Acceleration")
+
+    df_vel = run_query("VW_COST_VELOCITY")
+    if not df_vel.empty:
+        df_vel = clean_dates(df_vel, ["USAGE_DATE"])
+        drift_col = get_best_col(df_vel, ["DRIFT_STATUS", "STATUS"])
+        svc_col = get_best_col(df_vel, ["SERVICE_TYPE", "SERVICE"])
+        vel_col = get_best_col(df_vel, ["VELOCITY"])
+        cred_col = get_best_col(df_vel, ["DAILY_CREDITS", "CREDITS"])
+
+        if drift_col:
+            incidents = df_vel[df_vel[drift_col].isin(["SPIKE", "ACCELERATING"])].copy()
+            spikes = df_vel[df_vel[drift_col] == "SPIKE"]
+            accelerating = df_vel[df_vel[drift_col] == "ACCELERATING"]
+
+            worst_incident = None
+            if not incidents.empty and vel_col:
+                incidents = incidents.sort_values(vel_col, ascending=False)
+                worst_incident = incidents.iloc[0]
+
+            # Uniform KPI row — every card carries a value + delta
+            col_v1, col_v2, col_v3, col_v4 = st.columns(4)
+            with col_v1:
+                st.metric("Total Incidents", f"{len(incidents)}",
+                          delta="Requires review" if len(incidents) > 0 else "All clear",
+                          delta_color="inverse" if len(incidents) > 0 else "normal")
+            with col_v2:
+                st.metric("Spike Events", f"{len(spikes)}",
+                          delta="Above threshold" if len(spikes) > 0 else "None",
+                          delta_color="inverse" if len(spikes) > 0 else "normal")
+            with col_v3:
+                acc_n = accelerating[svc_col].nunique() if svc_col else len(accelerating)
+                st.metric("Accelerating Services", f"{acc_n}",
+                          delta="Trending up" if acc_n > 0 else "Stable",
+                          delta_color="inverse" if acc_n > 0 else "normal")
+            with col_v4:
+                if worst_incident is not None:
+                    st.metric("Peak Velocity", f"{safe_num(worst_incident[vel_col]):.2f}x",
+                              delta=str(worst_incident[svc_col])[:20] if svc_col else "—",
+                              delta_color="inverse")
+                else:
+                    st.metric("Peak Velocity", "—", delta="No spikes", delta_color="normal")
+
+            if worst_incident is not None:
+                st.error(
+                    f"**Primary culprit:** `{worst_incident[svc_col] if svc_col else 'unknown'}` on "
+                    f"**{worst_incident.get('USAGE_DATE', '-')}** consumed "
+                    f"**{safe_num(worst_incident[cred_col]) if cred_col else 0:.2f} credits** — "
+                    f"{safe_num(worst_incident[vel_col]):.2f}x its 7-day rolling average."
+                )
+
+            st.markdown("#### Credit Usage Spikes")
+            if not incidents.empty:
+                inc_cols = [c for c in ["USAGE_DATE", svc_col, cred_col, "ROLLING_AVG_7D",
+                                        vel_col, "ACCELERATION", drift_col]
+                            if c and c in incidents.columns]
+                show_table(axis_label(incidents[inc_cols], {
+                    "USAGE_DATE": "Date", svc_col: "Service", cred_col: "Daily Credits",
+                    "ROLLING_AVG_7D": "7-Day Avg", vel_col: "Velocity",
+                    "ACCELERATION": "Acceleration", drift_col: "Status",
+                }))
+                st.caption("Velocity = daily credits / 7-day rolling average. Values above 1.0 mean spend is running hot.")
+            else:
+                st.success("No spike or acceleration incidents in the analysis window.")
+
+        vel_grain = drill_control("vel_grain", default="Date")
+        st.markdown(f"#### Consumption Trajectory by {vel_grain}")
+        vel_chart = apply_drill(df_vel, "USAGE_DATE", [cred_col], vel_grain, group_col=svc_col, drill_key="vel_grain")
+        vel_chart = axis_label(vel_chart, {"USAGE_DATE": vel_grain, cred_col: "Credits",
+                                           svc_col: "Service"})
+        safe_render_chart("line", vel_chart, [vel_grain], ["Credits"], ["Service"])
+
+        with st.expander("Full velocity history (all days, highest velocity first)"):
+            show_table(axis_label(
+                df_vel.sort_values(vel_col, ascending=False) if vel_col else df_vel,
+                {"USAGE_DATE": "Date", svc_col: "Service", cred_col: "Daily Credits",
+                 "ROLLING_AVG_7D": "7-Day Avg", vel_col: "Velocity",
+                 "ACCELERATION": "Acceleration", drift_col: "Status"}
+            ))
+    else:
+        st.caption("No velocity data available.")
+
+
+# ==============================================================================
+# 13. ANOMALIES
+# ==============================================================================
+with tab_anomalies:
+    st.markdown("### Cost Anomaly Intelligence")
+
+    df_anom = run_query("VW_COST_ANOMALIES")
+    df_usd = run_query("VW_COST_SUMMARY_USD")
+
+    if not df_anom.empty:
+        df_anom = clean_dates(df_anom, ["USAGE_DATE"])
+        z_col = get_best_col(df_anom, ["Z_SCORE"])
+        flag_col = get_best_col(df_anom, ["ANOMALY_FLAG", "SEVERITY"])
+        wh_col_a = get_best_col(df_anom, ["WAREHOUSE_NAME", "SERVICE_TYPE"])
+        dc_col = get_best_col(df_anom, ["DAILY_CREDITS"])
+
+        # Only true anomalies, sorted by deviation magnitude (highest first)
+        if flag_col:
+            true_anom = df_anom[~df_anom[flag_col].astype(str).str.upper().isin(["NORMAL", ""])].copy()
+        else:
+            true_anom = df_anom.copy()
+
+        if z_col:
+            true_anom = true_anom.sort_values(z_col, ascending=False)
+            df_anom_sorted = df_anom.sort_values(z_col, ascending=False)
+        else:
+            df_anom_sorted = df_anom
+
+        col1, col2, col3, col4 = st.columns(4)
+        with col1:
+            st.metric("Anomalous Events", f"{len(true_anom)}",
+                      delta="Investigate" if len(true_anom) > 0 else "Clear",
+                      delta_color="inverse" if len(true_anom) > 0 else "normal")
+        with col2:
+            excess = safe_num(true_anom[dc_col].sum()) if (dc_col and not true_anom.empty) else 0.0
+            st.metric("Excess Credits", f"{excess:,.3f} cr",
+                      delta="Above baseline" if excess > 0 else "None",
+                      delta_color="inverse" if excess > 0 else "normal")
+        with col3:
+            peak_dev = safe_num(true_anom[z_col].max()) if (z_col and not true_anom.empty) else 0.0
+            st.metric("Peak Deviation", f"{peak_dev:,.2f} σ" if peak_dev else "—",
+                      delta="Severe" if peak_dev >= 3 else ("Moderate" if peak_dev > 0 else "None"),
+                      delta_color="inverse" if peak_dev >= 3 else ("off" if peak_dev > 0 else "normal"))
+        with col4:
+            if not true_anom.empty and wh_col_a:
+                st.metric("Main Culprit", str(true_anom.iloc[0][wh_col_a])[:20],
+                          delta="Highest deviation", delta_color="inverse")
+            else:
+                st.metric("Main Culprit", "None", delta="No outliers", delta_color="normal")
+
+        if not true_anom.empty:
+            top = true_anom.iloc[0]
+            st.error(
+                f"**Highest deviation event:** `{top[wh_col_a] if wh_col_a else 'unknown'}` on "
+                f"**{top.get('USAGE_DATE', '-')}** spent "
+                f"**{safe_num(top[dc_col]) if dc_col else 0:.4f} credits** — "
+                f"{safe_num(top[z_col]) if z_col else 0:.2f} standard deviations above its 14-day mean "
+                f"(`{flag_col and top[flag_col]}`)."
+            )
+
+            st.markdown("#### Confirmed Anomalies — Highest Deviation First")
+            show_table(true_anom)
+        else:
+            st.success("No statistical outliers detected — all spend is within 2 standard deviations of normal.")
+
+        st.markdown("#### Deviation Distribution")
+        anom_plot = axis_label(df_anom_sorted, {
+            "USAGE_DATE": "Date", z_col: "Deviation (σ)" if z_col else None,
+            "DAILY_CREDITS": "Daily Credits",
+        })
+        safe_render_chart("scatter", anom_plot, ["Date", "USAGE_DATE", "DATE"],
+                          ["Deviation (σ)"] if z_col else ["Daily Credits"], [flag_col, wh_col_a])
+
+        with st.expander("Full anomaly scan history (all days, sorted by deviation)"):
+            show_table(df_anom_sorted)
+    else:
+        st.caption("No anomaly data available in the analysis window.")
+
+
+# ==============================================================================
+# 14. ANTI-PATTERNS
+# ==============================================================================
+with tab_antipatterns:
+    st.markdown("### Query Execution Anti-Patterns")
+    st.caption("Ranked by impact — the patterns at the top are wasting the most compute.")
+
+    df_dups = run_query("VW_DUPLICATE_QUERIES")
+    df_failed = run_query("VW_FAILED_QUERIES")
+    df_scans_ap = run_query("VW_FULL_TABLE_SCANS")
+    df_spill_ap = run_query("VW_SPILLING_QUERIES")
+
+    n_dups = len(df_dups) if not df_dups.empty else 0
+    n_failed = len(df_failed) if not df_failed.empty else 0
+    n_scans = len(df_scans_ap) if not df_scans_ap.empty else 0
+    n_spill = len(df_spill_ap) if not df_spill_ap.empty else 0
+
+    # Uniform KPI row — same shape and neutral wording on every card
+    ca1, ca2, ca3, ca4 = st.columns(4)
+    with ca1:
+        st.metric("Duplicate Patterns", f"{n_dups}",
+                  delta="Detected" if n_dups else "None",
+                  delta_color="inverse" if n_dups else "normal")
+    with ca2:
+        st.metric("Failed Queries", f"{n_failed}",
+                  delta="Detected" if n_failed else "None",
+                  delta_color="inverse" if n_failed else "normal")
+    with ca3:
+        st.metric("Full Table Scans", f"{n_scans}",
+                  delta="Detected" if n_scans else "None",
+                  delta_color="inverse" if n_scans else "normal")
+    with ca4:
+        st.metric("Disk Spilling", f"{n_spill}",
+                  delta="Detected" if n_spill else "None",
+                  delta_color="inverse" if n_spill else "normal")
+
+    st.markdown("#### Duplicate Query Signatures")
+    if not df_dups.empty:
+        d_sort = get_best_col(df_dups, ["TOTAL_CREDITS", "EXECUTION_COUNT", "RUN_COUNT", "CREDITS"])
+        dups_show = clean_dates(df_dups).sort_values(d_sort, ascending=False) if d_sort else clean_dates(df_dups)
+        show_table(dups_show)
+        if d_sort:
+            hash_col = get_best_col(df_dups, ["QUERY_PARAMETERIZED_HASH", "QUERY_HASH", "USER_NAME"])
+            dup_plot = axis_label(df_dups.nlargest(10, d_sort), {hash_col: "Query Signature", d_sort: "Impact"})
+            safe_render_chart("bar", dup_plot, ["Query Signature"], ["Impact"])
+    else:
+        st.caption("No duplicate query signatures detected.")
+
+    st.markdown("#### Failed Query Executions")
+    if not df_failed.empty:
+        f_sort = get_best_col(df_failed, ["TOTAL_CREDITS", "CREDITS", "ELAPSED_SECONDS",
+                                          "TOTAL_ELAPSED_TIME", "FAILURE_COUNT"])
+        show_table(clean_dates(df_failed).sort_values(f_sort, ascending=False) if f_sort else clean_dates(df_failed))
+    else:
+        st.caption("No high-cost query failures recorded.")
+
+    col_ap3, col_ap4 = st.columns(2)
+    with col_ap3:
+        st.markdown("#### Full Table Scans")
+        if not df_scans_ap.empty:
+            s_sort = get_best_col(df_scans_ap, ["GB_SCANNED", "MB_SCANNED", "PARTITIONS_SCANNED", "ELAPSED_SECONDS"])
+            show_table(
+                clean_dates(df_scans_ap).sort_values(s_sort, ascending=False).head(15) if s_sort
+                else clean_dates(df_scans_ap).head(15)
+            )
+        else:
+            st.caption("No full table scans detected.")
+    with col_ap4:
+        st.markdown("#### Disk Spilling")
+        if not df_spill_ap.empty:
+            sp_sort = get_best_col(df_spill_ap, ["MB_SPILLED_REMOTE", "GB_SPILLED", "MB_SPILLED_LOCAL", "ELAPSED_SECONDS"])
+            show_table(
+                clean_dates(df_spill_ap).sort_values(sp_sort, ascending=False).head(15) if sp_sort
+                else clean_dates(df_spill_ap).head(15)
+            )
+        else:
+            st.caption("No spilling queries detected.")
+
+
+# ==============================================================================
+# 15. CONCURRENCY & SIZING
+# ==============================================================================
+with tab_concurrency:
+    st.markdown("### Concurrency & Rightsizing")
+
+    df_conc = run_query("VW_CONCURRENCY")
+    df_peaks = run_query("VW_PEAK_HOURS")
+
+    if not df_conc.empty:
+        df_conc = df_conc.copy()
+        # Normalize HOUR_SLOT into readable date + hour-of-day columns
+        slot_col = get_best_col(df_conc, ["HOUR_SLOT", "USAGE_HOUR", "HOUR"])
+        if slot_col:
+            raw = df_conc[slot_col].astype(str).str.replace('"', '', regex=False).str.strip()
+            parsed = pd.to_datetime(raw, errors="coerce", utc=False)
+            if parsed.notna().any():
+                df_conc["SLOT_DATE"] = parsed.dt.strftime("%Y-%m-%d")
+                df_conc["HOUR_OF_DAY"] = parsed.dt.hour
+                df_conc["TIME_SLOT"] = parsed.dt.strftime("%H:00") + " – " + (
+                    (parsed.dt.hour + 1) % 24).astype(str).str.zfill(2) + ":00"
+                df_conc = df_conc.drop(columns=[slot_col])
+
+        q_col = get_best_col(df_conc, ["QUERIES_IN_HOUR", "QUERY_COUNT"])
+        u_col_c = get_best_col(df_conc, ["UNIQUE_USERS"])
+        qd_col = get_best_col(df_conc, ["QUEUED_COUNT", "QUEUED"])
+        avg_col = get_best_col(df_conc, ["AVG_QUERY_SEC", "AVG_SECONDS"])
+
+        peak_row = df_conc.nlargest(1, q_col).iloc[0] if q_col else None
+        total_queued = safe_num(df_conc[qd_col].sum()) if qd_col else 0
+
+        cc1, cc2, cc3, cc4 = st.columns(4)
+        with cc1:
+            st.metric("Peak Hour Volume",
+                      f"{safe_num(peak_row[q_col]):,.0f}" if peak_row is not None else "—",
+                      delta="Queries in busiest hour", delta_color="off")
+        with cc2:
+            st.metric("Peak Time Slot",
+                      str(peak_row.get("TIME_SLOT", "-")) if peak_row is not None else "—",
+                      delta=str(peak_row.get("SLOT_DATE", "")) if peak_row is not None else "—",
+                      delta_color="off")
+        with cc3:
+            st.metric("Queued Queries", f"{total_queued:,.0f}",
+                      delta="Under-provisioned" if total_queued > 0 else "No contention",
+                      delta_color="inverse" if total_queued > 0 else "normal")
+        with cc4:
+            avg_rt = safe_num(df_conc[avg_col].mean()) if avg_col else 0.0
+            st.metric("Avg Query Runtime", f"{avg_rt:,.2f} s",
+                      delta="Across all slots", delta_color="off")
+
+        if total_queued > 0 and qd_col:
+            queued_wh = df_conc[df_conc[qd_col] > 0]
+            wh_names = queued_wh[get_best_col(queued_wh, ["WAREHOUSE_NAME"])].unique() if not queued_wh.empty else []
+            if len(wh_names) > 0:
+                st.warning(
+                    f"**Queueing detected on {len(wh_names)} warehouse(s):** {', '.join(map(str, wh_names[:3]))}. "
+                    "Consider enabling multi-cluster scaling."
+                )
+
+        st.markdown("#### Load Distribution by Hour of Day")
+        if "HOUR_OF_DAY" in df_conc.columns and q_col:
+            by_hour = df_conc.groupby("HOUR_OF_DAY", as_index=False)[q_col].sum().sort_values("HOUR_OF_DAY")
+            by_hour["HOUR_LABEL"] = by_hour["HOUR_OF_DAY"].astype(int).astype(str).str.zfill(2) + ":00"
+            by_hour_plot = axis_label(by_hour, {"HOUR_LABEL": "Hour of Day", q_col: "Queries"})
+            safe_render_chart("bar", by_hour_plot, ["Hour of Day"], ["Queries"])
+
+        col_c1, col_c2 = st.columns(2)
+        with col_c1:
+            st.markdown("#### Busiest Hourly Slots")
+            show_cols = [c for c in ["SLOT_DATE", "TIME_SLOT", "WAREHOUSE_NAME", q_col, u_col_c, avg_col, qd_col]
+                         if c and c in df_conc.columns]
+            busiest = df_conc[show_cols].nlargest(20, q_col) if q_col else df_conc[show_cols]
+            show_table(axis_label(busiest, {
+                "SLOT_DATE": "Date", "TIME_SLOT": "Time Slot", "WAREHOUSE_NAME": "Warehouse",
+                q_col: "Queries", u_col_c: "Unique Users", avg_col: "Avg Runtime (s)",
+                qd_col: "Queued",
+            }))
+        with col_c2:
+            st.markdown("#### Peak Hours Analysis")
+            if not df_peaks.empty:
+                show_table(clean_dates(df_peaks, keep_time=True))
+            else:
+                st.caption("No peak hour data available.")
+    else:
+        st.caption("No concurrency data detected.")
+
+    st.markdown("---")
+    st.markdown("#### Sizing Recommendations")
+    df_wh_sizing = run_query("VW_WAREHOUSE_SIZING")
+    if not df_wh_sizing.empty:
+        show_table(clean_dates(df_wh_sizing))
+    else:
+        st.caption("No sizing recommendations available.")
+
+
+# ==============================================================================
+# 16. IDENTITY GOVERNANCE
+# ==============================================================================
+with tab_identity:
+    st.markdown("### Identity & Access Governance")
+
+    df_idle = run_query("VW_IDLE_USERS")
+    df_logins = run_query("VW_LOGIN_HISTORY")
+
+    if not df_idle.empty:
+        df_idle = clean_dates(df_idle, ["CREATED_ON", "LAST_SUCCESS_LOGIN"], keep_time=True)
+        status_col = get_best_col(df_idle, ["STATUS"])
+        days_col = get_best_col(df_idle, ["DAYS_SINCE_LOGIN"])
+
+        inactive = df_idle[df_idle[status_col].astype(str).str.contains("INACTIVE", na=False)] \
+            if status_col else df_idle
+        active = df_idle[~df_idle.index.isin(inactive.index)]
+
+        ci1, ci2, ci3, ci4 = st.columns(4)
+        with ci1:
+            st.metric("Total Accounts", f"{len(df_idle)}",
+                      delta="Tracked", delta_color="off")
+        with ci2:
+            st.metric("Inactive (30d+)", f"{len(inactive)}",
+                      delta="Deprovision candidates" if len(inactive) > 0 else "None",
+                      delta_color="inverse" if len(inactive) > 0 else "normal")
+        with ci3:
+            st.metric("Active Accounts", f"{len(active)}",
+                      delta="In use", delta_color="normal")
+        with ci4:
+            longest = int(safe_num(inactive[days_col].max())) if (days_col and not inactive.empty) else 0
+            st.metric("Longest Dormancy", f"{longest} days",
+                      delta="Review required" if longest > 60 else "Acceptable",
+                      delta_color="inverse" if longest > 60 else "normal")
+
+        if len(inactive) > 0:
+            st.warning(
+                f"**{len(inactive)} account(s) inactive for 30+ days.** Dormant accounts are an access-risk "
+                "surface and may hold unused warehouse grants. Review for deprovisioning."
+            )
+
+    col_id1, col_id2 = st.columns(2)
+    with col_id1:
+        st.markdown("#### User Account Inventory")
+        if not df_idle.empty:
+            sort_c = get_best_col(df_idle, ["DAYS_SINCE_LOGIN"])
+            idle_show = df_idle.sort_values(sort_c, ascending=False) if sort_c else df_idle
+            show_table(axis_label(idle_show, {
+                "USER_NAME": "User", "CREATED_ON": "Created",
+                "LAST_SUCCESS_LOGIN": "Last Login", "DAYS_SINCE_LOGIN": "Days Since Login",
+                "QUERIES_30D": "Queries (30d)", "STATUS": "Status",
+            }))
+        else:
+            st.caption("No user account data available.")
+
+    with col_id2:
+        st.markdown("#### Authentication Failures & Patterns")
+        if not df_logins.empty:
+            df_logins = clean_dates(df_logins, keep_time=True)
+            l_sort = get_best_col(df_logins, ["FAILURE_COUNT", "ATTEMPTS", "EVENT_TIMESTAMP", "LAST_ATTEMPT"])
+            show_table(df_logins.sort_values(l_sort, ascending=False) if l_sort else df_logins)
+        else:
+            st.caption("No recent login failures recorded.")
+
+
+# ==============================================================================
+# 17. AI / CORTEX
+# ==============================================================================
+with tab_ai:
+    st.markdown("### Cortex AI Usage & Model Consumption")
+
+    df_ai_svc = run_query("VW_CORTEX_AI_USAGE")
+    df_ai_model = run_query("VW_CORTEX_MODEL_USAGE")
+
+    if not df_ai_svc.empty:
+        df_ai_svc = clean_dates(df_ai_svc, ["USAGE_DATE"])
+        svc_totals = df_ai_svc.groupby("SERVICE_TYPE", as_index=False)["CREDITS_USED"].sum().sort_values(
+            "CREDITS_USED", ascending=False)
+
+        col_ai1, col_ai2, col_ai3, col_ai4 = st.columns(4)
+        with col_ai1:
+            st.metric("Total AI Credits", f"{safe_num(svc_totals['CREDITS_USED'].sum()):,.2f} cr",
+                      delta="Cortex consumption", delta_color="off")
+        with col_ai2:
+            st.metric("Top Service", str(svc_totals.iloc[0]["SERVICE_TYPE"])[:20] if len(svc_totals) > 0 else "—",
+                      delta=f"{safe_num(svc_totals.iloc[0]['CREDITS_USED']):,.1f} cr" if len(svc_totals) > 0 else "—",
+                      delta_color="off")
+        with col_ai3:
+            st.metric("Active AI Services", f"{len(svc_totals)}",
+                      delta="Distinct services", delta_color="off")
+        with col_ai4:
+            days_active = df_ai_svc["USAGE_DATE"].nunique()
+            st.metric("Days with AI Activity", f"{days_active}",
+                      delta="In analysis window", delta_color="off")
+
+        ai_grain = drill_control("ai_grain", default="Date")
+        col_aa, col_ab = st.columns(2)
+        with col_aa:
+            st.markdown("#### Credits by Service Type")
+            svc_plot = axis_label(svc_totals, {"SERVICE_TYPE": "Service", "CREDITS_USED": "Credits"})
+            safe_render_chart("bar", svc_plot, ["Service"], ["Credits"])
+            show_table(svc_plot)
+        with col_ab:
+            st.markdown(f"#### AI Spend Trend by {ai_grain}")
+            daily_ai = df_ai_svc.groupby("USAGE_DATE", as_index=False)["CREDITS_USED"].sum()
+            daily_ai = apply_drill(daily_ai, "USAGE_DATE", ["CREDITS_USED"], ai_grain, drill_key="ai_grain")
+            daily_ai = axis_label(daily_ai, {"USAGE_DATE": ai_grain, "CREDITS_USED": "Credits"})
+            safe_render_chart("area", daily_ai, [ai_grain], ["Credits"])
+    else:
+        st.caption("No Cortex AI usage data available yet.")
+
+    st.markdown("---")
+    st.markdown("### Model Economics — Token & Credit Breakdown")
+
+    if not df_ai_model.empty:
+        model_totals = df_ai_model.groupby(["FUNCTION_NAME", "MODEL_NAME"], as_index=False).agg({
+            "INVOCATIONS": "sum",
+            "TOTAL_INPUT_TOKENS": "sum",
+            "TOTAL_OUTPUT_TOKENS": "sum",
+            "TOTAL_TOKENS": "sum",
+            "TOTAL_CREDITS": "sum"
+        }).sort_values("TOTAL_CREDITS", ascending=False)
+
+        # Unit economics — the metric a CFO cares about
+        model_totals["CREDITS_PER_1K_TOKENS"] = (
+            model_totals["TOTAL_CREDITS"] / (model_totals["TOTAL_TOKENS"] / 1000).replace(0, pd.NA)
+        ).round(8)
+        total_ai_cr = safe_num(model_totals["TOTAL_CREDITS"].sum())
+        model_totals["PCT_OF_AI_SPEND"] = (
+            model_totals["TOTAL_CREDITS"] / total_ai_cr * 100
+        ).round(1) if total_ai_cr > 0 else 0
+
+        top_model = model_totals.iloc[0]
+
+        cm1, cm2, cm3, cm4 = st.columns(4)
+        with cm1:
+            st.metric("Tokens Processed", f"{safe_num(model_totals['TOTAL_TOKENS'].sum()):,.0f}",
+                      delta="Input + output", delta_color="off")
+        with cm2:
+            st.metric("Total Invocations", f"{safe_num(model_totals['INVOCATIONS'].sum()):,.0f}",
+                      delta="Model calls", delta_color="off")
+        with cm3:
+            st.metric("Costliest Function", str(top_model["FUNCTION_NAME"])[:20],
+                      delta=f"{safe_num(top_model['PCT_OF_AI_SPEND']):.1f}% of AI spend",
+                      delta_color="inverse")
+        with cm4:
+            st.metric("Distinct Models Used", f"{model_totals['MODEL_NAME'].nunique()}",
+                      delta="In use", delta_color="off")
+
+        st.info(
+            f"**Top cost driver:** `{top_model['FUNCTION_NAME']}`"
+            + (f" / `{top_model['MODEL_NAME']}`" if str(top_model['MODEL_NAME']) not in ("N/A", "", "None") else "")
+            + f" consumed **{safe_num(top_model['TOTAL_CREDITS']):.4f} credits** across "
+            f"{int(safe_num(top_model['INVOCATIONS']))} call(s) and "
+            f"{safe_num(top_model['TOTAL_TOKENS']):,.0f} tokens "
+            f"({safe_num(top_model['PCT_OF_AI_SPEND']):.1f}% of all AI spend)."
+        )
+
+        show_table(axis_label(model_totals, {
+            "FUNCTION_NAME": "Function", "MODEL_NAME": "Model", "INVOCATIONS": "Invocations",
+            "TOTAL_INPUT_TOKENS": "Input Tokens", "TOTAL_OUTPUT_TOKENS": "Output Tokens",
+            "TOTAL_TOKENS": "Total Tokens", "TOTAL_CREDITS": "Credits",
+            "CREDITS_PER_1K_TOKENS": "Credits / 1K Tokens", "PCT_OF_AI_SPEND": "% of AI Spend",
+        }))
+
+        col_m1, col_m2 = st.columns(2)
+        with col_m1:
+            st.markdown("#### Credits by Model")
+            model_plot = axis_label(model_totals, {
+                "MODEL_NAME": "Model", "TOTAL_CREDITS": "Credits", "FUNCTION_NAME": "Function"})
+            safe_render_chart("bar", model_plot, ["Model"], ["Credits"], ["Function"])
+        with col_m2:
+            st.markdown("#### Token Volume by Function")
+            fn_plot = axis_label(model_totals, {"FUNCTION_NAME": "Function", "TOTAL_TOKENS": "Tokens"})
+            safe_render_chart("bar", fn_plot, ["Function"], ["Tokens"])
+
+        st.markdown("#### Guardrail Signals")
+        guard_shown = 0
+        for _, m in model_totals.iterrows():
+            pct = safe_num(m["PCT_OF_AI_SPEND"])
+            calls = safe_num(m["INVOCATIONS"])
+            if pct > 40 and calls < 10:
+                st.warning(
+                    f"`{m['FUNCTION_NAME']}` accounts for **{pct:.1f}%** of AI spend on only "
+                    f"{int(calls)} call(s) — very high cost per invocation. Consider batching or "
+                    "restricting this function to approved workloads."
+                )
+                guard_shown += 1
+        if guard_shown == 0:
+            st.success("No single function is dominating AI spend disproportionately.")
+    else:
+        st.caption("No per-model usage data available yet.")
+
+    # --- Peak Day Deep Dive ---
+    st.markdown("---")
+    st.markdown("### Peak Day Deep Dive — Where Did Your Credits Go?")
+    st.caption("Select a specific day to see exactly which AI services consumed your credits.")
+
+    if not df_ai_svc.empty:
+        df_ai_dated = clean_dates(df_ai_svc.copy(), ["USAGE_DATE"])
+        available_dates = sorted(df_ai_dated["USAGE_DATE"].dropna().unique(), reverse=True)
+
+        if available_dates:
+            daily_by_svc = df_ai_dated.groupby(["USAGE_DATE", "SERVICE_TYPE"], as_index=False)["CREDITS_USED"].sum()
+            daily_totals = df_ai_dated.groupby("USAGE_DATE", as_index=False)["CREDITS_USED"].sum().sort_values(
+                "CREDITS_USED", ascending=False)
+            svc_totals_all = df_ai_dated.groupby("SERVICE_TYPE", as_index=False)["CREDITS_USED"].sum().sort_values(
+                "CREDITS_USED", ascending=False)
+
+            # --- KPI Row ---
+            total_ai_all = safe_num(svc_totals_all["CREDITS_USED"].sum())
+            peak_day_row = daily_totals.iloc[0] if len(daily_totals) > 0 else {}
+            peak_day_val = safe_num(peak_day_row.get("CREDITS_USED", 0))
+            peak_day_date = peak_day_row.get("USAGE_DATE", "—")
+            top_svc_name = svc_totals_all.iloc[0]["SERVICE_TYPE"] if len(svc_totals_all) > 0 else "—"
+            top_svc_cr = safe_num(svc_totals_all.iloc[0]["CREDITS_USED"]) if len(svc_totals_all) > 0 else 0
+            avg_daily = safe_num(daily_totals["CREDITS_USED"].mean()) if len(daily_totals) > 0 else 0
+
+            kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+            with kpi1:
+                st.metric("Total AI Credits", f"{total_ai_all:,.2f}",
+                          delta=f"{len(available_dates)} active days", delta_color="off")
+            with kpi2:
+                st.metric("Peak Day", f"{peak_day_val:,.2f} cr",
+                          delta=str(peak_day_date), delta_color="off")
+            with kpi3:
+                st.metric("Top Service", str(top_svc_name).replace("_", " ").title()[:22],
+                          delta=f"{top_svc_cr:,.2f} cr total", delta_color="off")
+            with kpi4:
+                st.metric("Avg Daily Burn", f"{avg_daily:,.2f} cr/day",
+                          delta="Across all AI services", delta_color="off")
+
+            # --- Donut Chart + Heatmap Row ---
+            col_donut, col_heat = st.columns([1, 2])
+
+            with col_donut:
+                st.markdown("#### Credit Share by Service")
+                fig_donut = px.pie(
+                    svc_totals_all, values="CREDITS_USED", names="SERVICE_TYPE",
+                    hole=0.5, color_discrete_sequence=px.colors.qualitative.Set2
+                )
+                fig_donut.update_traces(
+                    textposition="inside", textinfo="percent+label",
+                    textfont_size=11
+                )
+                fig_donut.update_layout(
+                    showlegend=False, margin=dict(t=20, b=20, l=20, r=20),
+                    height=340, paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)"
+                )
+                st.plotly_chart(fig_donut, use_container_width=True)
+
+            with col_heat:
+                st.markdown("#### Spend Intensity — Service × Date")
+                heat_data = daily_by_svc.pivot_table(
+                    index="SERVICE_TYPE", columns="USAGE_DATE", values="CREDITS_USED", aggfunc="sum"
+                ).fillna(0)
+                # Sort dates chronologically for the heatmap
+                heat_data = heat_data[sorted(heat_data.columns)]
+                fig_heat = px.imshow(
+                    heat_data.values,
+                    x=list(heat_data.columns),
+                    y=[s.replace("_", " ").title() for s in heat_data.index],
+                    color_continuous_scale="YlOrRd",
+                    aspect="auto",
+                    labels=dict(x="Date", y="Service", color="Credits")
+                )
+                fig_heat.update_layout(
+                    margin=dict(t=20, b=40, l=10, r=10),
+                    height=340, paper_bgcolor="rgba(0,0,0,0)",
+                    xaxis=dict(tickangle=-45, tickfont=dict(size=9)),
+                    yaxis=dict(tickfont=dict(size=10))
+                )
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+            # --- Day Selector ---
+            st.markdown("---")
+            peak_days_display = [f"{d}  —  {daily_totals[daily_totals['USAGE_DATE']==d]['CREDITS_USED'].sum():,.4f} credits"
+                                 for d in daily_totals["USAGE_DATE"].tolist()[:15]]
+            selected_idx = st.selectbox(
+                "Drill into a specific day (sorted by highest spend):",
+                range(len(peak_days_display)),
+                format_func=lambda i: peak_days_display[i],
+                key="ai_peak_day_select"
+            )
+            selected_date = daily_totals["USAGE_DATE"].tolist()[selected_idx]
+
+            # Filter to selected day
+            day_data = df_ai_dated[df_ai_dated["USAGE_DATE"] == selected_date].copy()
+            day_total = safe_num(day_data["CREDITS_USED"].sum())
+            day_data["PCT_OF_DAY"] = (day_data["CREDITS_USED"] / day_total * 100).round(1) if day_total > 0 else 0
+            day_data = day_data.sort_values("CREDITS_USED", ascending=False)
+
+            st.markdown(f"#### {selected_date} — Total: **{day_total:,.4f} credits**")
+
+            # Waterfall chart
+            waterfall_data = day_data.groupby("SERVICE_TYPE", as_index=False).agg(
+                {"CREDITS_USED": "sum", "PCT_OF_DAY": "sum"}).sort_values("CREDITS_USED", ascending=False)
+
+            fig_waterfall = go.Figure(go.Waterfall(
+                name="Credits",
+                orientation="v",
+                x=[s.replace("_", " ").title() for s in waterfall_data["SERVICE_TYPE"]],
+                y=waterfall_data["CREDITS_USED"].tolist(),
+                measure=["relative"] * len(waterfall_data),
+                connector={"line": {"color": "rgb(63, 63, 63)", "width": 1}},
+                increasing={"marker": {"color": "#3b82f6"}},
+                totals={"marker": {"color": "#1e40af"}},
+                text=[f"{v:,.4f}" for v in waterfall_data["CREDITS_USED"]],
+                textposition="outside",
+                textfont=dict(size=10)
+            ))
+            fig_waterfall.update_layout(
+                title=dict(text="Credit Contribution by Service", font=dict(size=13)),
+                height=320, margin=dict(t=50, b=40, l=40, r=20),
+                paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                yaxis=dict(title="Credits", gridcolor="#f1f5f9"),
+                xaxis=dict(tickfont=dict(size=10)),
+                showlegend=False
+            )
+            st.plotly_chart(fig_waterfall, use_container_width=True)
+
+            # Detail table
+            st.markdown("**Service Breakdown**")
+            svc_detail = waterfall_data.copy()
+            svc_detail["SERVICE"] = svc_detail["SERVICE_TYPE"].str.replace("_", " ").str.title()
+            show_table(axis_label(svc_detail[["SERVICE", "CREDITS_USED", "PCT_OF_DAY"]], {
+                "SERVICE": "Service", "CREDITS_USED": "Credits", "PCT_OF_DAY": "% of Day"
+            }))
+
+            # Insight callout
+            if not day_data.empty:
+                top_svc = waterfall_data.iloc[0]
+                st.info(
+                    f"**Top consumer on {selected_date}:** "
+                    f"`{top_svc['SERVICE_TYPE'].replace('_', ' ').title()}` "
+                    f"used **{safe_num(top_svc['CREDITS_USED']):,.4f} credits** "
+                    f"({safe_num(top_svc['PCT_OF_DAY']):.1f}% of day total)."
+                )
+
+            # Model-level detail if available
+            if not df_ai_model.empty:
+                df_model_dated = clean_dates(df_ai_model.copy(), ["USAGE_DATE"])
+                model_day = df_model_dated[df_model_dated["USAGE_DATE"] == selected_date].copy()
+                if not model_day.empty:
+                    st.markdown(f"#### Model-Level Detail for {selected_date}")
+                    model_day["MODEL_LABEL"] = model_day["MODEL_NAME"].fillna("—").replace("", "—")
+                    model_day_total = safe_num(model_day["TOTAL_CREDITS"].sum())
+                    model_day["PCT"] = (model_day["TOTAL_CREDITS"] / model_day_total * 100).round(1) if model_day_total > 0 else 0
+                    detail_table = model_day[["FUNCTION_NAME", "MODEL_LABEL", "INVOCATIONS", "TOTAL_TOKENS",
+                                              "TOTAL_CREDITS", "PCT"]].sort_values("TOTAL_CREDITS", ascending=False)
+                    show_table(axis_label(detail_table, {
+                        "FUNCTION_NAME": "Function", "MODEL_LABEL": "Model", "INVOCATIONS": "Invocations",
+                        "TOTAL_TOKENS": "Tokens", "TOTAL_CREDITS": "Credits", "PCT": "% of Model Spend",
+                    }))
+        else:
+            st.caption("No dated AI usage available for drill-down.")
+    else:
+        st.caption("No AI usage data available for peak day analysis.")
+
+
+# ==============================================================================
+# 18. ML FORECAST
+# ==============================================================================
+with tab_forecast:
+    st.markdown("### ML-Powered Spend Forecast")
+    st.caption("Generated by SNOWFLAKE.ML.FORECAST trained on your historical daily warehouse consumption.")
+
+    df_fc = run_query("ML_SPEND_FORECAST")
+    df_burn_fc = run_query("VW_BUDGET_BURNDOWN")
+
+    if not df_fc.empty:
+        df_fc = clean_dates(df_fc, ["FORECAST_DATE"])
+        df_fc = df_fc.sort_values("FORECAST_DATE")
+
+        total_pred = safe_num(df_fc["PREDICTED_CREDITS"].sum())
+        avg_daily = safe_num(df_fc["PREDICTED_CREDITS"].mean())
+        worst_case = safe_num(df_fc["PESSIMISTIC_SPEND"].sum())
+        best_case = safe_num(df_fc["OPTIMISTIC_SPEND"].sum())
+        peak_day = df_fc.loc[df_fc["PREDICTED_CREDITS"].idxmax()]
+
+        # Confidence band width = volatility indicator
+        band_width = safe_num((df_fc["PESSIMISTIC_SPEND"] - df_fc["OPTIMISTIC_SPEND"]).mean())
+        volatility = "High" if band_width > avg_daily * 4 else ("Moderate" if band_width > avg_daily * 2 else "Low")
+
+        # Trend direction: compare first vs last third of the horizon
+        third = max(1, len(df_fc) // 3)
+        early = safe_num(df_fc["PREDICTED_CREDITS"].head(third).mean())
+        late = safe_num(df_fc["PREDICTED_CREDITS"].tail(third).mean())
+        if early > 0:
+            trend_pct = ((late - early) / early) * 100
+        else:
+            trend_pct = 0
+        trend_label = "Rising" if trend_pct > 5 else ("Declining" if trend_pct < -5 else "Flat")
+
+        # Compare against actual recent spend
+        actual_30d = None
+        if not df_burn_fc.empty:
+            mtd_c = get_best_col(df_burn_fc, ["MTD_CREDITS", "MTD_SPEND"])
+            if mtd_c:
+                actual_30d = safe_num(df_burn_fc[mtd_c].iloc[-1])
+
+        cf1, cf2, cf3, cf4 = st.columns(4)
+        with cf1:
+            delta_txt = None
+            if actual_30d and actual_30d > 0:
+                diff = ((total_pred - actual_30d) / actual_30d) * 100
+                delta_txt = f"{diff:+.1f}% vs MTD actual"
+            st.metric("Forecast Total", f"{total_pred:,.2f} cr", delta=delta_txt, delta_color="inverse")
+        with cf2:
+            st.metric("Daily Run Rate", f"{avg_daily:,.3f} cr",
+                      delta=f"{trend_label} ({trend_pct:+.1f}%)",
+                      delta_color="inverse" if trend_pct > 5 else "normal")
+        with cf3:
+            st.metric("Worst Case", f"{worst_case:,.2f} cr",
+                      delta=f"Best: {max(best_case, 0):,.2f} cr", delta_color="off")
+        with cf4:
+            st.metric("Forecast Confidence", volatility + " variance",
+                      delta=f"±{band_width / 2:,.2f} cr/day", delta_color="off")
+
+        st.markdown("")
+        cs1, cs2, cs3 = st.columns(3)
+        with cs1:
+            st.metric("Horizon", f"{len(df_fc)} days")
+        with cs2:
+            st.metric("Peak Day", str(peak_day["FORECAST_DATE"]),
+                      delta=f"{safe_num(peak_day['PREDICTED_CREDITS']):,.3f} cr", delta_color="off")
+        with cs3:
+            st.metric("Forecast Window",
+                      f"{df_fc['FORECAST_DATE'].iloc[0]} → {df_fc['FORECAST_DATE'].iloc[-1]}")
+
+        if volatility == "High":
+            st.warning(
+                "**Wide confidence band.** Your historical usage is highly variable (intermittent workloads), "
+                "so treat the central prediction as a directional signal rather than a precise number. "
+                "The worst-case bound is the safer figure for budget planning."
+            )
+        if trend_pct > 10:
+            st.error(f"**Spend trending up {trend_pct:.1f}%** across the forecast horizon. Review new workloads.")
+        elif trend_pct < -10:
+            st.success(f"Spend trending down {abs(trend_pct):.1f}% — recent optimizations are taking effect.")
+
+        fc_grain = drill_control("fc_grain", default="Date")
+
+        st.markdown(f"#### Predicted Spend with Confidence Band by {fc_grain}")
+        chart_df = df_fc[["FORECAST_DATE", "OPTIMISTIC_SPEND", "PREDICTED_CREDITS", "PESSIMISTIC_SPEND"]].copy()
+        chart_df = apply_drill(
+            chart_df, "FORECAST_DATE",
+            ["OPTIMISTIC_SPEND", "PREDICTED_CREDITS", "PESSIMISTIC_SPEND"], fc_grain,
+            drill_key="fc_grain"
+        )
+        chart_df = chart_df.rename(columns={
+            "FORECAST_DATE": fc_grain,
+            "OPTIMISTIC_SPEND": "Best Case",
+            "PREDICTED_CREDITS": "Predicted",
+            "PESSIMISTIC_SPEND": "Worst Case",
+        })
+        safe_render_chart("line", chart_df, [fc_grain],
+                          ["Predicted", "Best Case", "Worst Case"], multi_y=True)
+
+        col_fc1, col_fc2 = st.columns(2)
+        with col_fc1:
+            st.markdown(f"#### Predicted Consumption by {fc_grain}")
+            bar_fc = apply_drill(df_fc, "FORECAST_DATE", ["PREDICTED_CREDITS"], fc_grain, drill_key="fc_grain_bar")
+            bar_fc = axis_label(bar_fc, {"FORECAST_DATE": fc_grain, "PREDICTED_CREDITS": "Credits"})
+            safe_render_chart("bar", bar_fc, [fc_grain], ["Credits"])
+        with col_fc2:
+            st.markdown("#### Cumulative Projected Spend")
+            cum_df = df_fc[["FORECAST_DATE"]].copy()
+            cum_df["Cumulative Credits"] = df_fc["PREDICTED_CREDITS"].cumsum().round(3)
+            cum_df = cum_df.rename(columns={"FORECAST_DATE": "Date"})
+            safe_render_chart("area", cum_df, ["Date"], ["Cumulative Credits"])
+
+        st.markdown("#### Detailed Forecast")
+        display_fc = df_fc.rename(columns={
+            "FORECAST_DATE": "Date",
+            "PREDICTED_CREDITS": "Predicted Credits",
+            "OPTIMISTIC_SPEND": "Best Case",
+            "PESSIMISTIC_SPEND": "Worst Case",
+        })
+        show_table(display_fc)
+
+        with st.expander("How to read this forecast"):
+            st.markdown("""
+- **Predicted Credits** — the model's central estimate for that day.
+- **Best / Worst Case** — the 95% prediction interval. Actual spend should fall inside this band.
+- **Negative best-case values** are a statistical artifact of high variance in the training data;
+  read them as "effectively zero" rather than a credit refund.
+- **For budgeting**, use the *Worst Case* total. For *expected* cost, use the Predicted total.
+- The model retrains only when you re-run `CREATE SNOWFLAKE.ML.FORECAST`. Refresh it periodically
+  (or via a scheduled Task) so predictions reflect recent behaviour.
+            """)
+    else:
+        st.caption("No ML forecast data available. Train COST_FORECASTER to generate predictions.")
