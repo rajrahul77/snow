@@ -1,0 +1,815 @@
+# Snowflake FinOps Command Center
+import math
+
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+import streamlit as st
+
+
+st.set_page_config(
+    page_title="Snowflake FinOps Command Center",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+SCHEMA = "ECOMMERCE_DEV.COST_ANALYTICS"
+DEFAULT_CREDIT_PRICE_USD = 3.00
+
+COLORS = {
+    "ink": "#0f172a",
+    "muted": "#64748b",
+    "line": "#d9e2ec",
+    "accent": "#2563eb",
+    "accent_2": "#0891b2",
+    "good": "#059669",
+    "warn": "#d97706",
+    "bad": "#dc2626",
+    "violet": "#7c3aed",
+}
+
+PALETTE = [
+    COLORS["accent"],
+    COLORS["accent_2"],
+    COLORS["good"],
+    COLORS["warn"],
+    COLORS["violet"],
+    "#475569",
+    "#14b8a6",
+    "#f97316",
+]
+
+
+st.markdown(
+    """
+    <style>
+        .block-container {
+            max-width: 1500px;
+            padding-top: 1.15rem;
+            padding-bottom: 2.5rem;
+        }
+        html, body, [class*="css"] {
+            color: #0f172a;
+            font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        }
+        h1 {
+            font-size: 2.05rem !important;
+            letter-spacing: 0 !important;
+            margin-bottom: 0.1rem !important;
+        }
+        h2, h3 {
+            letter-spacing: 0 !important;
+        }
+        .hero {
+            border: 1px solid #d9e2ec;
+            border-radius: 8px;
+            padding: 18px 20px;
+            background:
+                linear-gradient(135deg, rgba(37,99,235,0.10), rgba(8,145,178,0.08)),
+                #ffffff;
+            margin: 0.3rem 0 1rem 0;
+        }
+        .hero-title {
+            font-size: 0.78rem;
+            color: #2563eb;
+            font-weight: 750;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            margin-bottom: 0.25rem;
+        }
+        .hero-copy {
+            color: #334155;
+            max-width: 980px;
+            font-size: 0.98rem;
+            line-height: 1.45;
+        }
+        div[data-testid="stMetric"] {
+            background: #ffffff;
+            border: 1px solid #d9e2ec;
+            border-radius: 8px;
+            padding: 14px 15px;
+            min-height: 112px;
+            box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04);
+        }
+        div[data-testid="stMetric"] label {
+            color: #64748b !important;
+            font-size: 0.72rem !important;
+            font-weight: 700 !important;
+            letter-spacing: 0.055em;
+            text-transform: uppercase;
+        }
+        div[data-testid="stMetricValue"] {
+            color: #0f172a;
+            font-size: 1.42rem !important;
+            font-weight: 750 !important;
+            line-height: 1.25 !important;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        div[data-testid="stMetricDelta"] {
+            font-size: 0.75rem !important;
+            font-weight: 650 !important;
+        }
+        .stTabs [data-baseweb="tab-list"] {
+            gap: 4px;
+            border-bottom: 1px solid #d9e2ec;
+            overflow-x: auto;
+        }
+        .stTabs [data-baseweb="tab"] {
+            border-radius: 6px 6px 0 0;
+            color: #64748b;
+            font-size: 0.84rem;
+            font-weight: 650;
+            padding: 9px 14px;
+            white-space: nowrap;
+        }
+        .stTabs [aria-selected="true"] {
+            color: #0f172a !important;
+            border-bottom: 2px solid #2563eb !important;
+            background: #ffffff !important;
+        }
+        .stDataFrame {
+            border: 1px solid #d9e2ec;
+            border-radius: 8px;
+        }
+        div[data-testid="stAlert"] {
+            border-radius: 8px;
+            border-left-width: 4px;
+        }
+        section[data-testid="stSidebar"] {
+            background: #f8fafc;
+        }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+def safe_num(value, default=0.0):
+    try:
+        if value is None:
+            return default
+        if isinstance(value, (pd.Series, pd.Index)):
+            return float(pd.to_numeric(value, errors="coerce").fillna(0).sum())
+        if pd.isna(value):
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def fmt_compact(value, suffix="", decimals=1):
+    value = safe_num(value)
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    if value >= 1_000_000:
+        return f"{sign}{value / 1_000_000:.{decimals}f}M{suffix}"
+    if value >= 1_000:
+        return f"{sign}{value / 1_000:.{decimals}f}K{suffix}"
+    return f"{sign}{value:,.{decimals}f}{suffix}"
+
+
+def pct(part, total, default=0.0):
+    total = safe_num(total)
+    return default if total == 0 else safe_num(part) / total * 100
+
+
+def get_best_col(df, candidates):
+    if df is None or df.empty:
+        return None
+    lookup = {c.upper(): c for c in df.columns}
+    for candidate in candidates:
+        if candidate and candidate.upper() in lookup:
+            return lookup[candidate.upper()]
+    return None
+
+
+def clean_dates(df, cols=None, keep_time=False):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    targets = cols or [
+        c for c in out.columns
+        if any(token in c.upper() for token in ("DATE", "TIME", "CREATED_ON", "SLOT", "LOGIN"))
+    ]
+    for col in targets:
+        if col not in out.columns:
+            continue
+        try:
+            raw = out[col].astype(str).str.replace('"', "", regex=False).str.strip()
+            parsed = pd.to_datetime(raw, errors="coerce")
+            if parsed.notna().any():
+                out[col] = parsed.dt.strftime("%Y-%m-%d %H:%M" if keep_time else "%Y-%m-%d").fillna("")
+            else:
+                out[col] = raw
+        except Exception:
+            pass
+    return out
+
+
+def prepare_frame(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    for col in out.columns:
+        if pd.api.types.is_datetime64_any_dtype(out[col]):
+            out[col] = out[col].dt.strftime("%Y-%m-%d").fillna("")
+            continue
+        if out[col].dtype == "object":
+            raw = out[col].astype(str).str.replace('"', "", regex=False).str.strip()
+            date_probe = pd.to_datetime(raw, errors="coerce")
+            if len(raw.dropna()) > 0 and date_probe.notna().mean() > 0.85:
+                has_time = bool((date_probe.dt.hour.fillna(0) != 0).any() or (date_probe.dt.minute.fillna(0) != 0).any())
+                out[col] = date_probe.dt.strftime("%Y-%m-%d %H:%M" if has_time else "%Y-%m-%d").fillna("")
+                continue
+            numeric = pd.to_numeric(raw, errors="coerce")
+            if numeric.notna().mean() > 0.85:
+                out[col] = numeric.fillna(0)
+            else:
+                out[col] = raw.fillna("")
+    return out
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def run_query(view_name):
+    try:
+        conn = st.connection("snowflake")
+        data = conn.query(f"SELECT * FROM {SCHEMA}.{view_name}")
+        return prepare_frame(data)
+    except Exception:
+        return pd.DataFrame()
+
+
+def metric_card(label, value, delta=None, mood="neutral"):
+    delta_color = {"good": "normal", "bad": "inverse", "neutral": "off"}.get(mood, "off")
+    st.metric(label, value, delta=delta, delta_color=delta_color)
+
+
+def empty_state(message):
+    st.caption(message)
+
+
+def style_fig(fig, height=360, legend=True):
+    fig.update_layout(
+        template="plotly_white",
+        height=height,
+        margin=dict(t=34, r=20, b=42, l=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        colorway=PALETTE,
+        font=dict(color=COLORS["ink"], size=12),
+        hovermode="x unified",
+    )
+    if legend:
+        fig.update_layout(legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0))
+    else:
+        fig.update_layout(showlegend=False)
+    fig.update_xaxes(showgrid=False, linecolor=COLORS["line"], zeroline=False)
+    fig.update_yaxes(gridcolor="#eef2f7", zeroline=False)
+    return fig
+
+
+def plot_area(df, x, y, color=None, title=None, height=390):
+    if df.empty or not x or not y:
+        empty_state("No data available for this visual.")
+        return
+    fig = px.area(df, x=x, y=y, color=color, title=title, color_discrete_sequence=PALETTE)
+    st.plotly_chart(style_fig(fig, height=height), use_container_width=True)
+
+
+def plot_line(df, x, y, color=None, title=None, height=360):
+    if df.empty or not x or not y:
+        empty_state("No data available for this visual.")
+        return
+    fig = px.line(df, x=x, y=y, color=color, markers=True, title=title, color_discrete_sequence=PALETTE)
+    fig.update_traces(line=dict(width=2.6), marker=dict(size=6))
+    st.plotly_chart(style_fig(fig, height=height), use_container_width=True)
+
+
+def plot_bar(df, x, y, color=None, title=None, orientation="v", height=360):
+    if df.empty or not x or not y:
+        empty_state("No data available for this visual.")
+        return
+    fig = px.bar(
+        df,
+        x=x if orientation == "v" else y,
+        y=y if orientation == "v" else x,
+        color=color,
+        title=title,
+        orientation=orientation,
+        color_discrete_sequence=PALETTE,
+    )
+    if orientation == "h":
+        fig.update_layout(yaxis={"categoryorder": "total ascending"})
+    st.plotly_chart(style_fig(fig, height=height), use_container_width=True)
+
+
+def plot_donut(df, names, values, title=None, height=340):
+    if df.empty or not names or not values:
+        empty_state("No data available for this visual.")
+        return
+    fig = px.pie(df, names=names, values=values, hole=0.58, title=title, color_discrete_sequence=PALETTE)
+    fig.update_traces(textposition="inside", textinfo="percent", hovertemplate="%{label}<br>%{value:,.2f}<extra></extra>")
+    st.plotly_chart(style_fig(fig, height=height), use_container_width=True)
+
+
+def show_table(df, height=360):
+    if df is None or df.empty:
+        empty_state("No records available.")
+        return
+    st.dataframe(df, hide_index=True, use_container_width=True, height=height)
+
+
+def grain_selector(key):
+    try:
+        value = st.segmented_control("Granularity", ["Day", "Week", "Month"], default="Day", key=key)
+        return value or "Day"
+    except Exception:
+        return st.radio("Granularity", ["Day", "Week", "Month"], horizontal=True, key=key)
+
+
+def aggregate_by_date(df, date_col, value_cols, grain="Day", group_col=None, agg="sum"):
+    if df.empty or not date_col:
+        return pd.DataFrame()
+    out = df.copy()
+    parsed = pd.to_datetime(out[date_col], errors="coerce")
+    out = out[parsed.notna()].copy()
+    if out.empty:
+        return pd.DataFrame()
+    parsed = pd.to_datetime(out[date_col], errors="coerce")
+    if grain == "Month":
+        out[date_col] = parsed.dt.to_period("M").dt.to_timestamp()
+    elif grain == "Week":
+        out[date_col] = parsed.dt.to_period("W").apply(lambda p: p.start_time)
+    else:
+        out[date_col] = parsed.dt.date
+    cols = [c for c in value_cols if c in out.columns]
+    keys = [date_col] + ([group_col] if group_col and group_col in out.columns else [])
+    if not cols:
+        return pd.DataFrame()
+    grouped = out.groupby(keys, as_index=False)[cols].agg(agg).sort_values(date_col)
+    grouped[date_col] = pd.to_datetime(grouped[date_col]).dt.strftime("%Y-%m-%d")
+    return grouped
+
+
+def user_context():
+    try:
+        conn = st.connection("snowflake")
+        ctx = conn.query("SELECT CURRENT_USER() AS USER_NAME, CURRENT_ROLE() AS PRIMARY_ROLE")
+        if ctx is not None and not ctx.empty:
+            user = str(ctx["USER_NAME"].iloc[0]).replace("_", " ").replace(".", " ").title()
+            role = str(ctx["PRIMARY_ROLE"].iloc[0])
+            return user, role
+    except Exception:
+        pass
+    return "FinOps Team", "DEMO"
+
+
+def build_action_plan(df_waste, df_anom, df_active, df_spcs, df_topq, credit_price_usd):
+    rows = []
+    if df_waste is not None and not df_waste.empty:
+        for _, row in df_waste.iterrows():
+            wh = str(row.get("WAREHOUSE_NAME", "Warehouse"))
+            credits = safe_num(row.get("CREDITS_14D", 0))
+            score = safe_num(row.get("EFFICIENCY_SCORE", 100))
+            util = safe_num(row.get("UTILIZATION_PCT", 100))
+            spill = safe_num(row.get("SPILL_PCT", 0))
+            scan = safe_num(row.get("FULL_SCAN_PCT", 0))
+            queue = safe_num(row.get("QUEUE_PCT", 0))
+            if score < 70 and credits > 0:
+                rows.append(["High" if score < 55 else "Medium", "Warehouse efficiency", wh, f"Efficiency {score:.0f}/100 on {credits:.1f} credits", "Tune auto-suspend, rightsize, and isolate noisy workloads.", credits])
+            if util < 20 and credits > 0:
+                rows.append(["High", "Idle compute", wh, f"Only {util:.1f}% active-hour utilization", "Set AUTO_SUSPEND to 60 seconds and review schedule-based shutdown.", credits])
+            if spill > 5:
+                rows.append(["Medium", "Performance waste", wh, f"{spill:.1f}% of queries spill to disk", "Resize memory-heavy jobs or rewrite high-cardinality joins.", credits])
+            if scan > 50:
+                rows.append(["Medium", "Scan waste", wh, f"{scan:.1f}% full table scans", "Add clustering/search optimization for repeatedly scanned tables.", credits])
+            if queue > 10:
+                rows.append(["Medium", "Concurrency", wh, f"{queue:.1f}% queued queries", "Enable multi-cluster scaling or separate interactive and batch workloads.", credits])
+
+    if df_active is not None and not df_active.empty:
+        for _, row in df_active.iterrows():
+            status = str(row.get("STATUS_RECOMMENDATION", "")).upper()
+            if "UNUSED" in status or "IDLE" in status:
+                rows.append([
+                    "High" if "UNUSED" in status else "Medium",
+                    "Resource hygiene",
+                    str(row.get("RESOURCE_NAME", "Resource")),
+                    str(row.get("STATUS_RECOMMENDATION", "Idle resource")),
+                    "Confirm ownership, suspend unused resources, and remove stale schedules.",
+                    safe_num(row.get("CREDITS_7D", 0)),
+                ])
+
+    if df_spcs is not None and not df_spcs.empty and "COMPUTE_POOL_NAME" in df_spcs.columns:
+        pools = df_spcs.groupby("COMPUTE_POOL_NAME", as_index=False).agg(
+            {"PROJECTED_MONTHLY_CREDITS": "max", "LIFETIME_CREDITS": "max"}
+        )
+        for _, row in pools.nlargest(5, "PROJECTED_MONTHLY_CREDITS").iterrows():
+            projected = safe_num(row.get("PROJECTED_MONTHLY_CREDITS", 0))
+            if projected > 0:
+                rows.append([
+                    "High" if projected >= 25 else "Medium",
+                    "Container services",
+                    str(row.get("COMPUTE_POOL_NAME", "Compute pool")),
+                    f"Projected {projected:.1f} credits this month",
+                    "Introduce start/stop policy and owner-level chargeback.",
+                    projected,
+                ])
+
+    if df_anom is not None and not df_anom.empty and "ANOMALY_FLAG" in df_anom.columns:
+        spikes = df_anom[df_anom["ANOMALY_FLAG"].astype(str).str.upper() == "SPIKE"].copy()
+        if "Z_SCORE" in spikes.columns:
+            spikes = spikes.sort_values("Z_SCORE", ascending=False)
+        for _, row in spikes.head(5).iterrows():
+            rows.append([
+                "High",
+                "Anomaly response",
+                str(row.get("WAREHOUSE_NAME", "Warehouse")),
+                f"{safe_num(row.get('DAILY_CREDITS', 0)):.2f} credits on {row.get('USAGE_DATE', '-')}",
+                "Review deployment, user, or job change that caused the spike.",
+                safe_num(row.get("DAILY_CREDITS", 0)),
+            ])
+
+    if df_topq is not None and not df_topq.empty:
+        costly = df_topq.nlargest(5, "ESTIMATED_CREDITS") if "ESTIMATED_CREDITS" in df_topq.columns else df_topq.head(5)
+        for _, row in costly.iterrows():
+            credits = safe_num(row.get("ESTIMATED_CREDITS", 0))
+            if credits > 0:
+                rows.append([
+                    "Medium",
+                    "Query optimization",
+                    str(row.get("USER_NAME", "User")),
+                    f"{credits:.4f} credits, {safe_num(row.get('GB_SCANNED', 0)):.1f} GB scanned",
+                    "Inspect query profile, pruning, joins, and warehouse size.",
+                    credits,
+                ])
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows, columns=["Priority", "Area", "Target", "Signal", "Recommended Action", "Impact Credits"])
+    rank = {"High": 0, "Medium": 1, "Low": 2}
+    out["_rank"] = out["Priority"].map(rank).fillna(9)
+    out = out.sort_values(["_rank", "Impact Credits"], ascending=[True, False]).drop(columns=["_rank"])
+    out["Estimated USD"] = (out["Impact Credits"] * credit_price_usd).round(2)
+    return out
+
+
+user_name, primary_role = user_context()
+
+with st.sidebar:
+    st.markdown("### FinOps Controls")
+    analysis_window = st.selectbox("Analysis Window", ["Last 30 days", "Last 60 days", "Last 90 days"], index=2)
+    budget_input = st.number_input("Monthly Credit Target", min_value=1.0, value=100.0, step=10.0)
+    usd_rate = st.number_input("Credit Price (USD)", min_value=0.01, value=float(DEFAULT_CREDIT_PRICE_USD), step=0.25)
+    if st.button("Refresh Data", use_container_width=True):
+        run_query.clear()
+        st.rerun()
+    st.caption(f"Signed in as {user_name} | role {primary_role}")
+
+window_days = int(analysis_window.split()[1])
+
+df_service = run_query("VW_COST_BY_SERVICE")
+df_forecast = clean_dates(run_query("VW_COST_FORECAST"), ["USAGE_DATE"])
+df_burn = clean_dates(run_query("VW_BUDGET_BURNDOWN"), ["USAGE_DATE"])
+df_waste = run_query("VW_WASTE_SCORE")
+df_top = run_query("VW_TOP_RESOURCES")
+df_anom = clean_dates(run_query("VW_COST_ANOMALIES"), ["USAGE_DATE"])
+df_active = clean_dates(run_query("VW_ACTIVE_RESOURCES"), ["LAST_USED", "LAST_QUERY_TIME"], keep_time=True)
+df_wh = clean_dates(run_query("VW_WAREHOUSE_DAILY"), ["USAGE_DATE"])
+df_users = clean_dates(run_query("VW_USER_COSTS"), ["USAGE_DATE"])
+df_perf = clean_dates(run_query("VW_QUERY_PERFORMANCE"), ["QUERY_DATE"])
+df_queue = clean_dates(run_query("VW_QUEUE_TIMES"), ["QUERY_DATE"])
+df_topq = clean_dates(run_query("VW_TOP_EXPENSIVE_QUERIES"), ["QUERY_DATE"])
+df_spcs = clean_dates(run_query("VW_SPCS_SERVICE_COSTS"), ["USAGE_DATE", "LAST_ACTIVE_DATE"])
+df_ai_svc = clean_dates(run_query("VW_CORTEX_AI_USAGE"), ["USAGE_DATE"])
+df_ai_model = clean_dates(run_query("VW_CORTEX_MODEL_USAGE"), ["USAGE_DATE"])
+df_storage = clean_dates(run_query("VW_STORAGE_DAILY"), ["USAGE_DATE"])
+df_velocity = clean_dates(run_query("VW_COST_VELOCITY"), ["USAGE_DATE"])
+df_ml_fc = clean_dates(run_query("ML_SPEND_FORECAST"), ["FORECAST_DATE"])
+
+date_col = get_best_col(df_service, ["USAGE_DATE"])
+credit_col = get_best_col(df_service, ["TOTAL_CREDITS", "CREDITS_USED", "CREDITS"])
+if not df_service.empty and date_col and credit_col:
+    max_date = pd.to_datetime(df_service[date_col], errors="coerce").max()
+    cutoff = max_date - pd.Timedelta(days=window_days)
+    df_service_window = df_service[pd.to_datetime(df_service[date_col], errors="coerce") >= cutoff].copy()
+else:
+    df_service_window = pd.DataFrame()
+
+total_window_credits = safe_num(df_service_window[credit_col].sum()) if credit_col and not df_service_window.empty else 0
+total_window_usd = total_window_credits * usd_rate
+
+mtd_credits = 0.0
+projected_eom = 0.0
+avg_daily_rate = 0.0
+days_remaining = 0
+if not df_burn.empty:
+    latest_burn = df_burn.iloc[-1]
+    mtd_credits = safe_num(latest_burn.get("MTD_CREDITS", 0))
+    projected_eom = safe_num(latest_burn.get("PROJECTED_EOM", 0))
+    avg_daily_rate = safe_num(latest_burn.get("AVG_DAILY_RATE", 0))
+    days_remaining = int(safe_num(latest_burn.get("DAYS_REMAINING", 0)))
+
+efficiency_score = safe_num(df_waste["EFFICIENCY_SCORE"].mean()) if not df_waste.empty and "EFFICIENCY_SCORE" in df_waste else 0
+anomaly_count = 0
+if not df_anom.empty and "ANOMALY_FLAG" in df_anom.columns:
+    anomaly_count = len(df_anom[df_anom["ANOMALY_FLAG"].astype(str).str.upper() == "SPIKE"])
+
+total_ai_credits = safe_num(df_ai_svc["CREDITS_USED"].sum()) if not df_ai_svc.empty and "CREDITS_USED" in df_ai_svc else 0
+ai_share = pct(total_ai_credits, total_ai_credits + total_window_credits)
+action_plan = build_action_plan(df_waste, df_anom, df_active, df_spcs, df_topq, usd_rate)
+action_impact = safe_num(action_plan["Impact Credits"].head(10).sum()) if not action_plan.empty else 0
+
+st.title("Snowflake FinOps Command Center")
+st.markdown(
+    """
+    <div class="hero">
+        <div class="hero-title">Executive cost intelligence</div>
+        <div class="hero-copy">
+            A board-ready view of Snowflake spend, forecast risk, workload economics, and optimization actions.
+            The dashboard is organized around decisions: where money is going, why it changed, and what to do next.
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+k1, k2, k3, k4, k5 = st.columns(5)
+with k1:
+    metric_card("MTD Credits", fmt_compact(mtd_credits, " cr"), f"${mtd_credits * usd_rate:,.0f}", "bad")
+with k2:
+    delta = "Over target" if projected_eom > budget_input else "Within target"
+    metric_card("Projected Month", fmt_compact(projected_eom, " cr"), delta, "bad" if projected_eom > budget_input else "good")
+with k3:
+    mood = "good" if efficiency_score >= 80 else "bad" if efficiency_score < 60 else "neutral"
+    metric_card("Efficiency Score", f"{efficiency_score:,.0f}/100", "Target 80+", mood)
+with k4:
+    metric_card("Optimization Pipeline", fmt_compact(action_impact, " cr"), f"${action_impact * usd_rate:,.0f} potential", "good")
+with k5:
+    metric_card("Anomaly Spikes", f"{anomaly_count}", "Investigate" if anomaly_count else "All clear", "bad" if anomaly_count else "good")
+
+if projected_eom > budget_input:
+    overrun = projected_eom - budget_input
+    st.error(
+        f"Projected month-end spend is {overrun:,.1f} credits above the current target. "
+        f"Daily burn must stay below {(budget_input - mtd_credits) / max(days_remaining, 1):,.2f} credits/day for the rest of the month."
+    )
+elif projected_eom > 0:
+    st.success(f"Current run rate is projected to finish {budget_input - projected_eom:,.1f} credits under target.")
+
+tabs = st.tabs(["Executive", "Spend Drivers", "Optimization", "Performance", "AI Economics", "Forecast"])
+
+with tabs[0]:
+    left, right = st.columns([2, 1])
+    with left:
+        grain = grain_selector("exec_grain")
+        if not df_service_window.empty:
+            svc_col = get_best_col(df_service_window, ["SERVICE_TYPE", "SERVICE"])
+            trend = aggregate_by_date(df_service_window, date_col, [credit_col], grain, group_col=svc_col)
+            plot_area(trend, date_col, credit_col, svc_col, f"Credit Consumption by Service - {grain}", height=430)
+        else:
+            empty_state("Cost-by-service history is not available.")
+    with right:
+        if not df_top.empty:
+            top_col = get_best_col(df_top, ["RESOURCE_NAME"])
+            cost_col = get_best_col(df_top, ["TOTAL_CREDITS"])
+            top = df_top.nlargest(8, cost_col) if cost_col else df_top.head(8)
+            plot_donut(top, top_col, cost_col, "Top Resource Share", height=430)
+        else:
+            empty_state("Top resource usage is not available.")
+
+    st.markdown("### Board Narrative")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.info(f"**Spend posture:** {fmt_compact(total_window_credits, ' credits')} consumed in the selected window, or ${total_window_usd:,.0f} at the current credit rate.")
+    with c2:
+        st.info(f"**Efficiency posture:** warehouse score is {efficiency_score:,.0f}/100; low scores indicate idle compute, spills, full scans, or queueing.")
+    with c3:
+        st.info(f"**Action posture:** the top optimization queue represents roughly {fmt_compact(action_impact, ' credits')} of addressable spend.")
+
+    if not action_plan.empty:
+        st.markdown("### Top Recommended Actions")
+        show_table(action_plan.head(8), height=310)
+
+with tabs[1]:
+    st.markdown("### Spend Drivers")
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        if not df_top.empty:
+            top_col = get_best_col(df_top, ["RESOURCE_NAME"])
+            type_col = get_best_col(df_top, ["RESOURCE_TYPE"])
+            spend_col = get_best_col(df_top, ["TOTAL_CREDITS"])
+            top_plot = df_top.nlargest(12, spend_col) if spend_col else df_top.head(12)
+            plot_bar(top_plot, top_col, spend_col, type_col, "Top Cost Drivers", orientation="h", height=440)
+    with c2:
+        if not df_users.empty:
+            user_col = get_best_col(df_users, ["USER_NAME"])
+            user_credit_col = get_best_col(df_users, ["TOTAL_CREDITS", "COMPUTE_CREDITS"])
+            if user_col and user_credit_col:
+                user_totals = df_users.groupby(user_col, as_index=False)[user_credit_col].sum().nlargest(12, user_credit_col)
+                plot_bar(user_totals, user_col, user_credit_col, None, "Spend Attribution by User", orientation="h", height=440)
+
+    st.markdown("### Warehouse Consumption")
+    if not df_wh.empty:
+        wh_date = get_best_col(df_wh, ["USAGE_DATE"])
+        wh_col = get_best_col(df_wh, ["WAREHOUSE_NAME"])
+        wh_credit = get_best_col(df_wh, ["CREDITS_USED", "TOTAL_CREDITS"])
+        if wh_col and wh_credit:
+            top_whs = df_wh.groupby(wh_col)[wh_credit].sum().nlargest(8).index.tolist()
+            filtered_wh = df_wh[df_wh[wh_col].isin(top_whs)]
+            wh_grain = grain_selector("warehouse_grain")
+            wh_trend = aggregate_by_date(filtered_wh, wh_date, [wh_credit], wh_grain, group_col=wh_col)
+            plot_line(wh_trend, wh_date, wh_credit, wh_col, f"Top Warehouse Spend - {wh_grain}", height=430)
+    else:
+        empty_state("Warehouse daily usage is not available.")
+
+    if not df_storage.empty:
+        st.markdown("### Storage Footprint")
+        db_col = get_best_col(df_storage, ["DATABASE_NAME"])
+        gb_col = get_best_col(df_storage, ["TOTAL_GB", "STORAGE_GB"])
+        if db_col and gb_col:
+            latest_date = df_storage["USAGE_DATE"].max() if "USAGE_DATE" in df_storage.columns else None
+            latest_storage = df_storage[df_storage["USAGE_DATE"] == latest_date] if latest_date else df_storage
+            plot_bar(latest_storage.nlargest(12, gb_col), db_col, gb_col, None, "Largest Databases by Storage", orientation="h", height=360)
+
+with tabs[2]:
+    st.markdown("### Optimization Workbench")
+    if not df_waste.empty:
+        w1, w2 = st.columns([1, 1])
+        wh_col = get_best_col(df_waste, ["WAREHOUSE_NAME"])
+        score_col = get_best_col(df_waste, ["EFFICIENCY_SCORE"])
+        spend_col = get_best_col(df_waste, ["CREDITS_14D"])
+        with w1:
+            score_plot = df_waste.sort_values(score_col).head(15) if score_col else df_waste.head(15)
+            plot_bar(score_plot, wh_col, score_col, None, "Lowest Efficiency Warehouses", orientation="h", height=430)
+        with w2:
+            factor_cols = [c for c in ["UTILIZATION_PCT", "CACHE_MISS_PCT", "FULL_SCAN_PCT", "SPILL_PCT", "QUEUE_PCT"] if c in df_waste.columns]
+            if factor_cols and wh_col:
+                heat = df_waste.set_index(wh_col)[factor_cols].fillna(0)
+                fig = px.imshow(
+                    heat,
+                    aspect="auto",
+                    color_continuous_scale=["#ecfdf5", "#fef3c7", "#fee2e2"],
+                    labels=dict(x="Signal", y="Warehouse", color="%"),
+                    title="Waste Signal Heatmap",
+                )
+                st.plotly_chart(style_fig(fig, height=430, legend=False), use_container_width=True)
+
+        st.markdown("### Warehouse Efficiency Matrix")
+        table = df_waste.sort_values(spend_col, ascending=False) if spend_col else df_waste
+        show_table(table, height=360)
+    else:
+        empty_state("Efficiency scoring data is not available.")
+
+    st.markdown("### Resource Hygiene")
+    if not df_active.empty:
+        show_cols = [c for c in ["RESOURCE_NAME", "RESOURCE_TYPE", "CREDITS_7D", "QUERIES_7D", "HOURS_SINCE_LAST_USE", "STATUS_RECOMMENDATION"] if c in df_active.columns]
+        hygiene = df_active[show_cols].sort_values("CREDITS_7D", ascending=False) if "CREDITS_7D" in show_cols else df_active[show_cols]
+        show_table(hygiene, height=300)
+    else:
+        empty_state("Active resource hygiene view is not available.")
+
+    if not action_plan.empty:
+        st.markdown("### Prioritized Action Queue")
+        show_table(action_plan, height=420)
+
+with tabs[3]:
+    st.markdown("### Query Performance")
+    if not df_perf.empty:
+        q_date = get_best_col(df_perf, ["QUERY_DATE"])
+        q_total = get_best_col(df_perf, ["TOTAL_QUERIES"])
+        q_failed = get_best_col(df_perf, ["FAILED_QUERIES"])
+        q_spilled = get_best_col(df_perf, ["TOTAL_GB_SPILLED"])
+        total_q = safe_num(df_perf[q_total].sum()) if q_total else 0
+        total_failed = safe_num(df_perf[q_failed].sum()) if q_failed else 0
+        total_spilled = safe_num(df_perf[q_spilled].sum()) if q_spilled else 0
+        p1, p2, p3, p4 = st.columns(4)
+        with p1:
+            metric_card("Queries", f"{total_q:,.0f}", "90 day view", "neutral")
+        with p2:
+            metric_card("Failure Rate", f"{pct(total_failed, total_q):.2f}%", f"{total_failed:,.0f} failed", "bad" if total_failed else "good")
+        with p3:
+            metric_card("GB Spilled", fmt_compact(total_spilled, " GB"), "Memory pressure", "bad" if total_spilled else "good")
+        with p4:
+            avg_duration = safe_num(df_perf["AVG_DURATION_SEC"].mean()) if "AVG_DURATION_SEC" in df_perf.columns else 0
+            metric_card("Avg Runtime", f"{avg_duration:,.2f}s", "Across users", "neutral")
+
+        if q_date and q_total:
+            agg = {q_total: "sum"}
+            if q_failed:
+                agg[q_failed] = "sum"
+            if q_spilled:
+                agg[q_spilled] = "sum"
+            perf_daily = df_perf.groupby(q_date, as_index=False).agg(agg)
+            plot_line(perf_daily, q_date, q_total, None, "Query Volume Trend", height=360)
+    else:
+        empty_state("Query performance view is not available.")
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.markdown("### Queue Pressure")
+        if not df_queue.empty:
+            show_table(clean_dates(df_queue).sort_values("QUEUE_PCT", ascending=False) if "QUEUE_PCT" in df_queue.columns else df_queue, height=360)
+        else:
+            empty_state("No queue pressure records found.")
+    with c2:
+        st.markdown("### Costliest Queries")
+        if not df_topq.empty:
+            cols = [c for c in ["QUERY_DATE", "USER_NAME", "WAREHOUSE_NAME", "WAREHOUSE_SIZE", "ESTIMATED_CREDITS", "ELAPSED_SECONDS", "GB_SCANNED", "QUERY_TYPE"] if c in df_topq.columns]
+            costly = df_topq[cols].sort_values("ESTIMATED_CREDITS", ascending=False) if "ESTIMATED_CREDITS" in cols else df_topq[cols]
+            show_table(costly.head(25), height=360)
+        else:
+            empty_state("No expensive query records found.")
+
+with tabs[4]:
+    st.markdown("### AI and Cortex Economics")
+    if not df_ai_svc.empty and "CREDITS_USED" in df_ai_svc.columns:
+        svc_totals = df_ai_svc.groupby("SERVICE_TYPE", as_index=False)["CREDITS_USED"].sum().sort_values("CREDITS_USED", ascending=False)
+        a1, a2, a3, a4 = st.columns(4)
+        with a1:
+            metric_card("AI Credits", fmt_compact(total_ai_credits, " cr"), f"${total_ai_credits * usd_rate:,.0f}", "bad")
+        with a2:
+            metric_card("AI Share", f"{ai_share:.1f}%", "Of tracked spend", "bad" if ai_share > 25 else "neutral")
+        with a3:
+            top_ai = svc_totals.iloc[0] if not svc_totals.empty else {}
+            metric_card("Top AI Service", str(top_ai.get("SERVICE_TYPE", "-"))[:24], fmt_compact(top_ai.get("CREDITS_USED", 0), " cr"), "neutral")
+        with a4:
+            metric_card("Active Services", f"{len(svc_totals)}", "Cortex categories", "neutral")
+
+        c1, c2 = st.columns([1, 2])
+        with c1:
+            plot_donut(svc_totals, "SERVICE_TYPE", "CREDITS_USED", "AI Credit Share", height=400)
+        with c2:
+            ai_daily = aggregate_by_date(df_ai_svc, "USAGE_DATE", ["CREDITS_USED"], "Day", group_col="SERVICE_TYPE")
+            plot_area(ai_daily, "USAGE_DATE", "CREDITS_USED", "SERVICE_TYPE", "Daily AI Spend", height=400)
+    else:
+        empty_state("Cortex AI metering is not available.")
+
+    st.markdown("### Model Unit Economics")
+    if not df_ai_model.empty:
+        model_totals = df_ai_model.groupby(["FUNCTION_NAME", "MODEL_NAME"], as_index=False).agg({
+            "INVOCATIONS": "sum",
+            "TOTAL_TOKENS": "sum",
+            "TOTAL_CREDITS": "sum",
+        })
+        model_totals["CREDITS_PER_1K_TOKENS"] = (
+            model_totals["TOTAL_CREDITS"] / (model_totals["TOTAL_TOKENS"] / 1000).replace(0, math.nan)
+        ).fillna(0).round(6)
+        show_table(model_totals.sort_values("TOTAL_CREDITS", ascending=False), height=340)
+        plot_bar(model_totals.nlargest(12, "TOTAL_CREDITS"), "FUNCTION_NAME", "TOTAL_CREDITS", "MODEL_NAME", "Cost by AI Function", orientation="h", height=390)
+    else:
+        empty_state("Model-level Cortex usage is not available.")
+
+with tabs[5]:
+    st.markdown("### Forecast and Budget Risk")
+    f1, f2 = st.columns([2, 1])
+    with f1:
+        if not df_forecast.empty:
+            y_cols = [c for c in ["ACTUAL_CREDITS", "ROLLING_7D_AVG", "ROLLING_30D_AVG"] if c in df_forecast.columns]
+            if y_cols:
+                fc_long = df_forecast.melt(id_vars=["USAGE_DATE"], value_vars=y_cols, var_name="Metric", value_name="Credits")
+                plot_line(fc_long, "USAGE_DATE", "Credits", "Metric", "Actual vs Rolling Forecast", height=410)
+        else:
+            empty_state("Forecast history is not available.")
+    with f2:
+        budget_pct = pct(mtd_credits, budget_input)
+        fig = go.Figure(go.Indicator(
+            mode="gauge+number+delta",
+            value=budget_pct,
+            number={"suffix": "%"},
+            delta={"reference": 85},
+            title={"text": "Budget Used"},
+            gauge={
+                "axis": {"range": [0, 120]},
+                "bar": {"color": COLORS["accent"]},
+                "steps": [
+                    {"range": [0, 70], "color": "#ecfdf5"},
+                    {"range": [70, 90], "color": "#fef3c7"},
+                    {"range": [90, 120], "color": "#fee2e2"},
+                ],
+                "threshold": {"line": {"color": COLORS["bad"], "width": 3}, "value": 100},
+            },
+        ))
+        st.plotly_chart(style_fig(fig, height=410, legend=False), use_container_width=True)
+
+    if not df_burn.empty:
+        st.markdown("### Burn-Down")
+        burn = df_burn.copy()
+        burn["TARGET"] = budget_input
+        value_vars = [c for c in ["MTD_CREDITS", "PROJECTED_EOM", "TARGET"] if c in burn.columns]
+        burn_long = burn.melt(id_vars=["USAGE_DATE"], value_vars=value_vars, var_name="Metric", value_name="Credits")
+        plot_line(burn_long, "USAGE_DATE", "Credits", "Metric", "MTD, Projection, and Target", height=400)
+
+    if not df_ml_fc.empty:
+        st.markdown("### ML Forecast Confidence")
+        needed = [c for c in ["OPTIMISTIC_SPEND", "PREDICTED_CREDITS", "PESSIMISTIC_SPEND"] if c in df_ml_fc.columns]
+        if needed:
+            fc_long = df_ml_fc.melt(id_vars=["FORECAST_DATE"], value_vars=needed, var_name="Scenario", value_name="Credits")
+            plot_line(fc_long, "FORECAST_DATE", "Credits", "Scenario", "Predicted Credits with Best and Worst Case", height=400)
+
+    if not df_velocity.empty:
+        st.markdown("### Cost Velocity")
+        svc_col = get_best_col(df_velocity, ["SERVICE_TYPE"])
+        daily_col = get_best_col(df_velocity, ["DAILY_CREDITS"])
+        plot_line(df_velocity, "USAGE_DATE", daily_col, svc_col, "Spend Acceleration by Service", height=390)
