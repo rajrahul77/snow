@@ -146,3 +146,21 @@ input, return null or "to_be_defined".
 
 The success metric should name what should be measured,
 not invent a target percentage.
+STRICT GROUNDING RULES:
+
+Use only information explicitly provided by the upstream agents.
+
+Do not infer:
+- customer preferences
+- premium/luxury experience
+- discounts or offers
+- communication channels
+- likelihood of conversion
+- future behavior
+
+If something is not supported by the inputs, return null.
+
+Describe customers as selected targets, not as customers likely to convert.
+
+The success metric must only specify what should be measured,
+not a target percentage or timeline.
