@@ -164,3 +164,16 @@ Describe customers as selected targets, not as customers likely to convert.
 
 The success metric must only specify what should be measured,
 not a target percentage or timeline.
+When describing the selected customers, only reference measurable
+attributes explicitly provided by upstream agents.
+
+Do not describe them as having:
+- conversion potential
+- premium preferences or experiences
+- loyalty preferences
+- engagement potential
+- expected future behavior
+
+Do not mention benefits, offers or services unless provided in the input.
+
+Keep the recommended action generic when campaign details are unavailable.
