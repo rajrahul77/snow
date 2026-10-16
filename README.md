@@ -28,3 +28,19 @@ Return JSON only:
   "evidence": [],
   "objective": ""
 }
+Do not simply conclude that REPEAT_CUSTOMER is better than STANDARD_CUSTOMER.
+
+Identify an actionable growth opportunity inside the portfolio.
+
+Look for patterns such as:
+- high booking frequency but low revenue per booking
+- strong repeat behavior but below-peer customer value
+- high customer value but relatively low booking frequency
+
+The target_profile must logically match the stated opportunity.
+
+If the objective is converting customers into repeat customers,
+the target should be STANDARD_CUSTOMER candidates.
+
+If the objective is increasing value/retention,
+the target may be existing REPEAT_CUSTOMER customers.
