@@ -317,3 +317,14 @@ Do not provide a target percentage or timeframe unless supplied upstream.
 reason:
 Explain the recommendation using only factual evidence supplied by the upstream agents.
 Do not describe customers as likely to convert, high-potential, loyal, engaged, premium, or similar unless explicitly supported by the input.
+
+Never describe previous bookings as satisfactory, successful, premium,
+positive, or similar unless that information is explicitly provided.
+
+Never describe selected customers as promising, likely, high-potential,
+or strong candidates for conversion.
+
+Describe them only using observed facts such as:
+- one booking
+- STANDARD_CUSTOMER
+- revenue per booking above the cohort average
