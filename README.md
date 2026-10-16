@@ -79,3 +79,13 @@ Return JSON only:
     }
   ]
 }
+Identify high-value STANDARD_CUSTOMER candidates for a second-booking/retention strategy.
+
+Requirements:
+- STANDARD_CUSTOMER only
+- Total bookings > 0
+- Prioritize above-average revenue per booking
+- Also consider estimated customer value and stay duration
+- Use llm_output only as supporting context
+- Do not claim a customer is likely to repeat unless supported by available data
+- Return at most 10 customers
