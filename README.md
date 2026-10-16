@@ -125,3 +125,24 @@ Return JSON only:
   "success_metric": "",
   "reason": ""
 }
+STRICT RULES:
+
+Use only facts provided by the Portfolio Opportunity Agent
+and Customer Targeting Agent.
+
+Do not invent:
+- discounts
+- complimentary upgrades
+- credits
+- loyalty benefits
+- customer preferences
+- marketing channels
+- numerical targets
+- timelines
+- expected uplift
+
+If a channel, offer, target or timeline is not supported by the
+input, return null or "to_be_defined".
+
+The success metric should name what should be measured,
+not invent a target percentage.
