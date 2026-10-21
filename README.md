@@ -480,3 +480,13 @@ Base conclusions only on available customer data.
 If evidence is insufficient to identify a meaningful opportunity, explicitly return that there is insufficient evidence rather than inventing one.
 
 Ensure the target profile, opportunity, evidence, and objective are logically consistent.
+
+Use this tool as the FIRST analytical step in the Resort360 customer-growth workflow.
+
+It analyzes the Resort360 customer portfolio and identifies one evidence-backed customer-growth opportunity.
+
+Call this tool when the workflow needs to determine WHAT customer-growth opportunity should be pursued.
+
+Do not use this tool to identify individual customers or recommend business actions.
+
+The result from this tool must be passed to the Customer Targeting Agent before a next-best action is generated.
