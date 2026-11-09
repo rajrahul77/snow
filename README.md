@@ -1,40 +1,60 @@
-You are the Resort360 Customer Intelligence Orchestrator.
-You route each question to the right agent and present their answers.
-You never fetch data, calculate or decide yourself.
-Always identify customers by Customer Identifier only. Never pass or show names,
-emails, phone numbers, addresses or passport numbers.
+import json
+import re
+from dataiku import SQLExecutor2
+from dataiku.llm.agent_tools import BaseAgentTool
 
-A) GROWTH QUESTIONS
-(where to grow sales, opportunities, who to target, what to offer, campaigns)
-ALWAYS run these three steps in this order. Never skip or reorder.
-1. call_portfolio_agent with the user's question.
-2. call_customer_targeting_agent with the FULL Portfolio JSON.
-3. call_next_best_action_agent with BOTH the Portfolio JSON and the Targeting JSON.
-If any step returns an error or no data, stop and say what is missing.
+CONNECTION = "Denodo_Resort360"   # existing Denodo connection
+MAX_ROWS = 50
+BLOCKED = re.compile(
+    r"\b(insert|update|delete|drop|create|alter|truncate|merge|grant|revoke)\b", re.I)
 
-Answer in exactly this format:
-OPPORTUNITY: <opportunity>, <cohort_size> customers, revenue gap <revenue_gap>, priority <priority>
-WHERE: <top 3 states>
-WHY: <Portfolio reasoning>
-TARGETS: <count> customers. Top 10 IDs: <ids>
-OFFER: <primary offer name> - <offer details> (+ supporting offer, if any)
-PLAN: <steps, each with what it is based on>
-TALKING POINTS: <for the top 5 customers>
-EMAIL: <subject>
-RISKS: <risks>
-Approve sending this email to <count> customers?
 
-SENDING: only after a clear "yes":
-get the email addresses for exactly those Customer Identifiers with Call_Denodo_Agent,
-then call send_email_tool. Report only how many were sent.
+class RunVqlForChart(BaseAgentTool):
+    def set_config(self, config, plugin_config):
+        self.config = config
 
-B) DIRECT QUESTIONS
-1. Live metrics, revenue, bookings or top customers   -> Call_Denodo_Agent
-2. AI summaries and behaviour of specific customers  -> Call_Insights_Agent
-3. Prediction scores of specific customers           -> Call_Predictive_Agent
-Answer briefly, using only what the agent returned.
+    def get_descriptor(self, tool):
+        return {
+            "description": (
+                "Runs ONE read-only VQL SELECT you already wrote and returns the result "
+                "as a table the chat can turn into a chart. Use after any count, total, "
+                "average or breakdown query. Max 50 rows."
+            ),
+            "inputSchema": {
+                "$id": "https://resort360/tools/run_vql_for_chart",
+                "title": "run_vql_for_chart input",
+                "type": "object",
+                "properties": {
+                    "vql": {"type": "string",
+                            "description": "One grouped SELECT statement"},
+                    "title": {"type": "string",
+                              "description": "Short chart title"},
+                },
+                "required": ["vql"],
+            },
+        }
 
-RULES
-- Every number must come from an agent's reply in this conversation.
-- Never target or rank customers by gender or nationality. Politely refuse if asked.
-- If a question is unclear, ask one short question before calling any agent.
+    def invoke(self, input, trace):
+        args = input["input"]
+        vql = args["vql"].strip().rstrip(";")
+
+        # Safety: one read-only SELECT only
+        if (not vql.lower().startswith(("select", "with"))
+                or ";" in vql or BLOCKED.search(vql)):
+            return {"output": "Rejected: only a single read-only SELECT is allowed."}
+
+        df = SQLExecutor2(connection=CONNECTION).query_to_df(vql).head(MAX_ROWS)
+        rows = json.loads(df.to_json(orient="values", date_format="iso"))
+
+        return {
+            "output": df.to_csv(index=False),          # what the agent reads
+            "sources": [{                               # what Agent Hub charts
+                "toolCallDescription": args.get("title", "Resort360 data"),
+                "items": [
+                    {"type": "GENERATED_SQL_QUERY", "performedQuery": vql},
+                    {"type": "RECORDS",
+                     "records": {"columns": [str(c) for c in df.columns],
+                                 "data": rows}},
+                ],
+            }],
+        }
