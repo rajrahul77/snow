@@ -19,6 +19,21 @@ PII_WORDS = ["first name", "last name", "full name", "email", "mobile",
              "phone", "address", "passport", "birth"]
 
 
+def _as_dict(value):
+    """Accept the tool input as a dict, a JSON string, or a plain VQL string."""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            if isinstance(parsed, dict):
+                return parsed
+        except ValueError:
+            pass
+        return {"vql": value}
+    return {}
+
+
 def _clean(vql):
     vql = (vql or "").strip()
     fenced = re.search(r"```(?:sql|vql)?\s*(.*?)```", vql, re.S | re.I)
@@ -51,7 +66,8 @@ class RunVqlForChart(BaseAgentTool):
         }
 
     def invoke(self, input, trace):
-        args = input.get("input", {})
+        payload = _as_dict(input)
+        args = _as_dict(payload.get("input", payload))
         vql = _clean(args.get("vql"))
 
         # Safety: one read-only SELECT only
