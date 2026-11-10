@@ -19,7 +19,8 @@ from dataiku import SQLExecutor2
 CONNECTION = "Denodo_Resort360_Postgres"   # existing Denodo connection (the one that worked in the notebook)
 DATABASE = "resort360_n"                   # Denodo database holding the views
 LLM_ID = "PASTE_LLM_ID_HERE"               # see setup step 2 (use a Gemini Flash id)
-ALLOWED_TABLES = []                        # e.g. ["dp_customer_intelligence", "bookings"]; empty = read list from Denodo
+ORCHESTRATOR_ID = "PASTE_AGENT_ID_HERE"    # id of Customer_Intelligence_Orchestrator (starts with "agent:")
+ALLOWED_TABLES = ["dp_customer_intelligence"]  # your tables; set to [] to read the list from Denodo
 MAX_ROWS = 50
 IMPERSONATE = False                        # True only after webapp impersonation (RBAC) is set up
 # ------------------------------------------------------
@@ -46,6 +47,15 @@ def list_tables():
         return sorted(ALLOWED_TABLES)
     df = run_sql(f"SELECT name FROM GET_VIEWS() WHERE database_name = '{DATABASE}'")
     return sorted(df.iloc[:, 0].astype(str).tolist())
+
+
+def model_ids():
+    """List LLM and agent ids available in this project (to fill in the CONFIG)."""
+    try:
+        llms = dataiku.api_client().get_default_project().list_llms()
+        return [f"{l.id}  |  {l.description}" for l in llms]
+    except Exception as e:
+        return [f"Could not list models: {e}"]
 
 
 def is_pii(col):
@@ -123,8 +133,16 @@ def serve_layout():
             dcc.Store(id="session"),
             dcc.Textarea(id="question", placeholder="2. Ask a question about this table",
                          style={"width": "100%", "height": "70px", "marginTop": "8px"}),
-            html.Button("Ask", id="ask", style={"marginTop": "8px"}),
+            html.Div(style={"display": "flex", "gap": "8px", "marginTop": "8px"}, children=[
+                html.Button("Ask the data", id="ask"),
+                html.Button("Get growth plan (agents)", id="plan"),
+            ]),
             dcc.Loading(html.Div(id="result", style={"marginTop": "16px"})),
+            dcc.Loading(html.Div(id="plan_result", style={"marginTop": "16px"})),
+            html.Details(style={"marginTop": "32px", "color": "gray"}, children=[
+                html.Summary("Setup help: available LLM and agent ids"),
+                html.Pre("\n".join(model_ids())),
+            ]),
         ],
     )
 
@@ -147,18 +165,37 @@ def lock_table(_, table):
             f"Locked to {table}. Reload the page to switch tables.", True)
 
 
+def ensure_session(session, table):
+    """Use the locked session; if missing but a table is chosen, lock it now."""
+    if session:
+        return session
+    if not table:
+        return None
+    cols, sample = table_profile(table)
+    return {"table": table, "cols": cols, "sample": sample}
+
+
 @app.callback(  # noqa: F821
     Output("result", "children"),
     Input("ask", "n_clicks"), State("question", "value"), State("session", "data"),
-    prevent_initial_call=True)
-def ask(_, question, session):
+    State("table", "value"), prevent_initial_call=True)
+def ask(_, question, session, table_choice):
+    try:
+        session = ensure_session(session, table_choice)
+    except Exception as e:
+        return f"Could not read {table_choice}: {e}"
     if not session:
-        return "Lock a table first."
+        return "Choose a table and click Lock table first."
     if not question:
         return "Type a question."
+    if LLM_ID.startswith("PASTE"):
+        return "Set LLM_ID in the CONFIG first (see 'Setup help' at the bottom of the page)."
     table = session["table"]
 
-    sql = ask_llm_for_sql(table, session["cols"], session["sample"], question)
+    try:
+        sql = ask_llm_for_sql(table, session["cols"], session["sample"], question)
+    except Exception as e:
+        return f"LLM call failed: {e}"
     error = check_sql(sql, table)
     if error:
         return html.Div([html.P(error), html.Pre(sql)])
@@ -178,4 +215,36 @@ def ask(_, question, session):
                              columns=[{"name": str(c), "id": str(c)} for c in df.columns],
                              page_size=10),
         html.Details([html.Summary("Query used"), html.Pre(sql)]),
+    ])
+
+
+@app.callback(  # noqa: F821
+    Output("plan_result", "children"),
+    Input("plan", "n_clicks"), State("question", "value"), State("session", "data"),
+    State("table", "value"), prevent_initial_call=True)
+def growth_plan(_, question, session, table_choice):
+    """Send the question to the existing orchestrator agent
+    (Portfolio -> Targeting -> Next Best Action) and show its answer."""
+    if not session and table_choice:
+        session = {"table": table_choice}
+    if not session:
+        return "Choose a table and click Lock table first."
+    if not question:
+        return "Type a question, e.g. 'Where can we increase sales and who should we target?'"
+    if ORCHESTRATOR_ID.startswith("PASTE"):
+        return "Set ORCHESTRATOR_ID in the CONFIG first (see 'Setup help' at the bottom of the page)."
+    message = (f'Use only data from the table "{DATABASE}"."{session["table"]}".\n'
+               f"Question: {question}")
+    try:
+        agent = dataiku.api_client().get_default_project().get_llm(ORCHESTRATOR_ID)
+        completion = agent.new_completion()
+        completion.with_message(message)
+        answer = completion.execute().text or "No answer returned."
+    except Exception as e:
+        answer = f"Agent call failed: {e}"
+    return html.Div([
+        html.H4("Growth plan"),
+        dcc.Markdown(answer),
+        html.P("To send the email, approve it in Agent Hub (approval prompts are not shown here).",
+               style={"color": "gray"}),
     ])
