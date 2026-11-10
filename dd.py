@@ -84,16 +84,28 @@ class RunVqlForChart(BaseAgentTool):
         rows = json.loads(df.to_json(orient="values", date_format="iso"))
         columns = [str(c) for c in df.columns]
 
+        title = args.get("title") or "Resort360 data"
+        records_part = {
+            "type": "RECORDS",  # tells Agent Hub this is chartable data
+            "records": {"columns": columns, "data": rows},
+        }
+
         return {
             # What the agent reads
             "output": df.to_csv(index=False),
-            # What Agent Hub uses for "See details > Sources" and charts
+            # What Agent Hub draws charts from: an artifact of type RECORDS
+            "artifacts": [{
+                "type": "RECORDS",
+                "name": title,
+                "description": "Query result",
+                "parts": [records_part],
+            }],
+            # What "See details > Sources" shows: the query + the rows
             "sources": [{
-                "toolCallDescription": args.get("title") or "Resort360 data",
+                "toolCallDescription": title,
                 "items": [
                     {"type": "GENERATED_SQL_QUERY", "performedQuery": vql},
-                    {"type": "RECORDS",
-                     "records": {"columns": columns, "data": rows}},
+                    records_part,
                 ],
             }],
         }
